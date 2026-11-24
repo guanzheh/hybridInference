@@ -36,7 +36,11 @@ from typing import TYPE_CHECKING, Any
 from serving.batch.admission import finite_json_float, has_invalid_unicode
 from serving.batch.profiles import PROFILES
 from serving.batch.targets import TARGET_URLS, AdmissionContext, ItemRejected, admit_item
-from serving.servers.auth import StoredKeyRejected, authenticate_stored_key
+from serving.servers.auth import (
+    StoredKeyOrganizationSuspended,
+    StoredKeyRejected,
+    authenticate_stored_key,
+)
 from serving.storage.batch_store import TARGET_MESSAGES, BatchLimitExceeded
 from serving.utils.logging import get_logger
 
@@ -226,6 +230,19 @@ async def validate_file_batch(
             ),
         )
         return "failed"
+    except StoredKeyOrganizationSuspended:
+        # The input is not judged while the owner's organization is suspended,
+        # and the batch is not failed: a restore undoes the suspension, and
+        # the same key then authenticates. The batch keeps its lease and is
+        # tried again when the lease ends, so it is validated within one lease
+        # after a restore. No pause is written: the lease of a batch that
+        # waits for validation does not read one. So this line is the only
+        # place that says why the batch waits.
+        logger.info(
+            "batch %s: the owner's organization is suspended; validation waits for a restore",
+            batch_id,
+        )
+        return "retry"
     except Exception:
         logger.warning(
             "batch %s: owner could not be authenticated for validation", batch_id, exc_info=True

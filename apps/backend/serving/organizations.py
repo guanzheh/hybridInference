@@ -174,7 +174,8 @@ async def signs_in_through_sso_only(op_store: Any, user: Mapping[str, Any]) -> b
 
 
 #: The columns an identity carries of the organization its requests are checked
-#: against (:func:`serving.quota.organization_fields` reads them).
+#: against (:func:`serving.quota.organization_fields` reads the limit and the
+#: spend, :func:`suspended_in` whether the organization is suspended for it).
 ORGANIZATION_COLUMNS = (
     "organization_id",
     "organization_name",
@@ -182,7 +183,87 @@ ORGANIZATION_COLUMNS = (
     "organization_limit_amount",
     "organization_spent_month_usd",
     "organization_spent_month_amount",
+    "organization_suspended",
 )
+
+#: The code of the refusal a member of a suspended organization gets, and the
+#: reason its rejection and its failed sign-in are recorded with.
+SUSPENDED_CODE = "organization_suspended"
+
+
+def suspended_in(identity: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """The suspended organization a lookup row names for its account, if any.
+
+    From the ``organization_suspended`` column of the key lookups and of the
+    quota context of an account: the store decides for whom a suspension
+    applies (:func:`serving.storage.organizations.suspended_for`), and a place
+    that authenticates an account only reads the answer. None for a row of an
+    account the suspension does not reach, and for a row of a lookup that
+    reads no organization.
+    """
+    if not identity or identity.get("organization_suspended") is not True:
+        return None
+    return {
+        "organization_id": identity.get("organization_id"),
+        "organization_name": identity.get("organization_name"),
+    }
+
+
+async def suspended_organization_of(
+    op_store: Any, user_id: str, *, fresh: bool = False
+) -> dict[str, Any] | None:
+    """The suspended organization that refuses an account, read by account.
+
+    For a caller with no lookup row that carries it: a session, a sign-in, an
+    internal lookup. The store keeps the answer for a minute; *fresh* asks the
+    database, for a sign-in, which must not start a session on an old answer.
+    None for an account no suspension refuses, and in a store that keeps no
+    organizations.
+    """
+    lookup = getattr(op_store, "get_suspended_organization", None)
+    if lookup is None:
+        return None
+    try:
+        answer = lookup(user_id, fresh=fresh)
+        if inspect.isawaitable(answer):
+            answer = await answer
+    except OrganizationsUnavailableError:
+        return None
+    return dict(answer) if isinstance(answer, Mapping) and answer else None
+
+
+async def account_available(op_store: Any, user: Mapping[str, Any] | None) -> bool:
+    """Whether an account may act now: it is active, and no suspended organization refuses it.
+
+    *user* is the row of the account, None for an unknown one. For the places
+    that read an account by its id and answer for it: an internal lookup, a
+    grant route, the exchange of an identity code. Each of them answers for a
+    member of a suspended organization as it does for a suspended account.
+    """
+    if user is None or user.get("status") != "active":
+        return False
+    return await suspended_organization_of(op_store, user["id"]) is None
+
+
+def suspended_message(organization: Mapping[str, Any]) -> str:
+    """What a member of a suspended organization is told, wherever it is refused."""
+    name = organization.get("organization_name") or ""
+    return f"Organization '{name}' is suspended. Contact an administrator of your organization."
+
+
+def suspended_payload(organization: Mapping[str, Any], *, contact_email: str) -> dict[str, Any]:
+    """The body of the 403 a request with a key of a suspended organization gets.
+
+    It names the organization: a refusal that looked like an invalid key would
+    send the member to make a new key, which is refused the same way.
+    """
+    return {
+        "error": "Organization suspended",
+        "code": SUSPENDED_CODE,
+        "organization": organization.get("organization_name") or "",
+        "contact_email": contact_email,
+        "message": suspended_message(organization),
+    }
 
 
 async def month_spend_of(op_store: Any, organization_id: str, *, native: bool) -> Any:

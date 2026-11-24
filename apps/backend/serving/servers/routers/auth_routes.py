@@ -64,6 +64,7 @@ from serving.schemas_auth import (
 from serving.servers.auth import log_admin_action
 from serving.servers.deps import (
     get_current_user,
+    get_current_user_to_sign_out,
     get_db_logger,
     get_operational_store,
     user_audit_actor,
@@ -634,7 +635,10 @@ async def _sign_out_of_browser(
 async def logout(
     request: Request,
     response: Response,
-    current_user=Depends(get_current_user),
+    # Not get_current_user: a member of a suspended organization is refused on
+    # every other route, and its session is still live, so it must be able to
+    # end it.
+    current_user=Depends(get_current_user_to_sign_out),
     op_store=Depends(get_operational_store),
 ) -> LogoutResponse:
     """Sign the current account out of this browser.
@@ -772,12 +776,15 @@ async def delete_own_account(
     return DeleteAccountResponse(message="Your account has been deleted.")
 
 
-async def _usable_account(browser: BrowserSession, user_id: str | None) -> dict[str, Any]:
+async def _usable_account(
+    op_store: Any, browser: BrowserSession, user_id: str | None
+) -> dict[str, Any]:
     """Return a browser's account that may be given a token now.
 
     Raises:
         HTTPException: 401 when the account is not signed in on this browser,
-            or its session has ended; 403 when its address is unverified.
+            is not active, is refused by its suspended organization, or its
+            session has ended; 403 when its address is unverified.
     """
     account = browser.account(user_id)
     if account is None:
@@ -786,6 +793,13 @@ async def _usable_account(browser: BrowserSession, user_id: str | None) -> dict[
             detail="No account is signed in on this browser. Please login again.",
         )
     if account.get("status") is not None and account["status"] != "active":
+        raise HTTPException(status_code=401, detail="User account is not active.")
+    if (
+        await organizations.suspended_organization_of(op_store, account["user_id"], fresh=True)
+        is not None
+    ):
+        # A suspend ends no session, so this is where a live session stops
+        # getting tokens. The answer for an account that is not active.
         raise HTTPException(status_code=401, detail="User account is not active.")
     if not session_live(account):
         raise HTTPException(
@@ -829,7 +843,7 @@ async def refresh(
             detail="Invalid refresh token. Please login again.",
         )
 
-    account = await _usable_account(browser, browser.active_user_id)
+    account = await _usable_account(op_store, browser, browser.active_user_id)
     access_token, _role = await issue_account_token(op_store, account)
     await rotate_cookie(op_store, response, browser)
 
@@ -913,7 +927,7 @@ async def switch_account(
             detail="No account is signed in on this browser. Please login again.",
         )
 
-    account = await _usable_account(browser, body.user_id)
+    account = await _usable_account(op_store, browser, body.user_id)
     access_token, user_role = await issue_account_token(op_store, account)
     if body.activate:
         await op_store.set_browser_session_active(browser.id, account["user_id"])

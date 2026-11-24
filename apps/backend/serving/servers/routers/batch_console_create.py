@@ -62,6 +62,7 @@ from serving.batch.console_prepare import (
 from serving.batch.delivery import stream_upload
 from serving.batch.targets import AdmissionContext
 from serving.servers.auth import (
+    StoredKeyOrganizationSuspended,
     StoredKeyQuotaExceeded,
     StoredKeyRejected,
     authenticate_stored_key,
@@ -76,6 +77,7 @@ from serving.servers.deps import (
     get_operational_store,
     get_router,
     get_services,
+    refuse_suspended_organization,
 )
 from serving.servers.routers.batch_console import COPYABLE_TARGETS, batch_detail
 from serving.servers.routers.files import (
@@ -724,6 +726,11 @@ async def create_console_batch(
             "Your API key can no longer run batches (revoked, expired, or the account is not "
             "verified); check the submission again",
         ) from None
+    except StoredKeyOrganizationSuspended as exc:
+        # The session was admitted on an answer up to a minute old; the key is
+        # read now. The same 403 the session gets from its next request on.
+        refuse_suspended_organization(exc.organization, plain=True)
+        raise  # not reached: the line above raises
     if user_ctx.get("user_id") not in (None, owner):
         raise _error(409, "credential_changed", "Your API key changed since you confirmed")
     if body.copied_from is not None:

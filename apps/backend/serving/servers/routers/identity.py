@@ -22,6 +22,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, Field
 
+from serving import organizations
 from serving.servers.deps import get_current_user, get_operational_store
 from serving.utils.identity_keys import (
     IdentityKeyMisconfigured,
@@ -311,10 +312,11 @@ async def exchange_authorization_code(
         raise invalid
 
     # Re-read the account at exchange time. The code was issued up to a minute
-    # ago, and a suspension in between must take effect immediately rather than
-    # after the identity token expires downstream.
+    # ago, and a suspension in between -- of the account, or of its organization
+    # -- must take effect immediately rather than after the identity token
+    # expires downstream.
     user = await store.get_user_by_id(claim["user_id"])
-    if user is None or user.get("status") != "active":
+    if not await organizations.account_available(store, user):
         raise _error(
             status.HTTP_403_FORBIDDEN,
             "account_unavailable",

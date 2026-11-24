@@ -24,6 +24,7 @@ MEMBER_LIMIT_MAX_USD = Decimal("999999.9999")
 
 Period = Literal["1d", "7d", "30d"]
 MemberRole = Literal["member", "admin"]
+OrganizationStatus = Literal["active", "suspended"]
 
 
 def _without_outer_spaces(value: Any) -> Any:
@@ -70,6 +71,8 @@ class OrganizationResponse(MoneyResponse):
 
     id: str
     name: str
+    #: ``suspended`` while the gateway refuses the members of the organization.
+    status: OrganizationStatus = "active"
     created_at: datetime
     member_count: int
     #: NULL is no limit.
@@ -165,6 +168,37 @@ class SetMonthlyLimitRequest(MoneyInput):
         default=None, ge=0, le=MEMBER_LIMIT_MAX_USD, decimal_places=4
     )
     monthly_limit: Decimal | None = Field(default=None, ge=0, exclude=True)
+
+
+class DeleteOrganizationRequest(BaseModel):
+    """Delete an organization. This cannot be undone."""
+
+    confirm_name: str = Field(
+        ...,
+        max_length=200,
+        description="The name of the organization, exactly: a wrong id must not delete one",
+    )
+    password: str | None = Field(
+        None,
+        description="The signed-in administrator's password, for an account that confirms with it",
+    )
+    disable_connections: bool = Field(
+        True,
+        description=(
+            "Switch off the SSO_PROVIDERS entries of the organization, so that a first "
+            "sign-in through one makes no personal account"
+        ),
+    )
+
+
+class OrganizationDeletedResponse(BaseModel):
+    """What a delete did."""
+
+    message: str
+    #: The member accounts that were active and are now suspended.
+    accounts_suspended: int
+    #: The ``SSO_PROVIDERS`` entries this delete switched off.
+    connections_disabled: list[str] = Field(default_factory=list)
 
 
 class OrganizationMessageResponse(BaseModel):

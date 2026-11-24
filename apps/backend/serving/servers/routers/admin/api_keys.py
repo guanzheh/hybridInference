@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from serving.accounting import get_accounting_policy
 from serving.accounting_api import native_amount, native_quota_updates, primary_amounts
 from serving.audit import AuditActor, AuditTarget
-from serving.exceptions import ProjectNotFoundError
+from serving.exceptions import KeyOwnerSuspendedError, ProjectNotFoundError
 from serving.quota import resolve_quota
 from serving.schemas_admin import (
     APIKeyDetailResponse,
@@ -123,6 +123,11 @@ async def create_api_key(
         )
     except ProjectNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Project not found") from exc
+    except KeyOwnerSuspendedError as exc:
+        # A suspension revokes every key of the account. A key made after it
+        # would be live on an account that nothing else admits. Make the
+        # account active first.
+        raise HTTPException(status_code=409, detail=KeyOwnerSuspendedError.MESSAGE) from exc
 
     await log_admin_action(
         op_store,
