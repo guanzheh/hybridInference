@@ -1,7 +1,7 @@
 # Platform administrator console: organization overview and management
 
 - Date: 2026-11-21
-- Status: proposed, awaiting review. Implemented by the pull requests in §16
+- Status: proposed, awaiting review. Implemented by the two pull requests in §16
 - Issue: #1830 (RFC). The organization side is #1829
 - Scope: the status of an organization (active or suspended) and the checks that enforce it; suspend,
   restore and delete; an **Organizations** tab in the Admin Console; the pages of one organization for the
@@ -463,6 +463,14 @@ The platform administrator reads these audit rows with the `organization_id` fil
 
 - `period`: `1d`, `7d` or `30d`. `status`: `all`, `active` or `suspended`. `search`: a part of the name, or
   of a domain of a connection. `sort_by`: `name`, `members`, `requests`, `spend` or `month_spend`.
+- **Without `period`** a row has no usage: `requests`, the spend and the share are null, and the gateway
+  reads no usage. **Without `limit`** the answer has each row; with it, 200 at most. So a call with no
+  parameter gets each organization and no page, as before this work, in an answer that has more
+  fields. #1841 calls the route in this way, for the organization
+  filter of **Admin → Users**: a page of 50 would hide the organizations after the first 50 from that
+  filter, and a read of the usage would be made for a list of names.
+- An order by `requests` or by `spend` needs a period: without one, a 400. Rows with one figure stay in
+  the order of their names.
 - Each row: id, name, domains, status, number of members, requests and spend in the period, share of
   spend, the spend of this month and the limit. The fields that a row has today stay.
 - `totals` for the period, over all organizations: organizations, members, requests, spend.
@@ -490,17 +498,25 @@ The platform administrator reads these audit rows with the `organization_id` fil
 
 - The rollup has a reader for all time and a reader for one account. The list needs a new reader for a
   range of days, by account. The key of the rollup is the account and the day, so this is one statement.
-- The list does not read `api_logs`, except the live part of the rollup: today, and a day that the rollup
+- The list does not read `api_logs`, except the live part of the rollup: the days from the settled day
+  of the rollup on (today, and yesterday during the first hour of a UTC day), and a day that the rollup
   did not fill yet.
-- The route runs one grouped statement for each source. The number of statements does not grow with the
-  number of organizations.
+- The route runs one grouped read for each source: the organizations, the counters of the month and the
+  administrators, and with a period the spend and the requests. That is three reads, or five with a
+  period. The number does not grow with the number of organizations.
 - The domains come from `SSO_PROVIDERS`, not from a table. So the route applies `search`, the sort and the
   page to the rows in memory. The cost follows the number of organizations, not the usage.
 
 ## 7. One organization, for the platform administrator
 
-The functions behind the organization console take the organization as an argument. This work adds thin
-routes that pass the organization of the path:
+Each handler of the organization console is served a second time, below `/admin/organizations/{id}`.
+The handler is the same function. One of its dependencies is different: where the console gives the
+organization of the membership of the caller, these routes give the organization of the path, for a
+platform administrator (`organization_of_path`). So the two sets of routes cannot differ in a parameter,
+a rule or a body, and a route that the console gets later is here too. A test compares the two sets.
+
+The first text of this record had a thin route for each handler. Each such route would declare the
+parameters of its handler a second time, and a filter added to one side would be missing on the other.
 
 | Route below `/admin/organizations/{id}` | Same as, in the organization record §11.1 |
 |---|---|
@@ -531,7 +547,16 @@ itself, which `GET /admin/organizations/{id}` gives.
 - **Audit.** Each write records the platform administrator as the actor and has the `organization_id`. In
   the audit log, an organization administrator sees the actor as "Platform administrator", as today. The
   platform administrator sees the account of the actor. This is the one difference between a body of
-  these routes and the body of the organization route.
+  these routes and the body of the organization route. A handler knows who reads from its scope
+  (`for_platform`). The search and the member filter are those of the console: they do not find a
+  platform administrator by its address.
+- **`ADMIN_TOKEN`** can call these routes, as it can call each Admin route. Its audit rows name no
+  account.
+- **A member that the platform administrator removes** is told so: its suspension message says "by a
+  platform administrator", where a removal in the console says "by its administrator".
+- **A route of the console that these routes cannot serve** stops the start of the gateway: a handler
+  that does not take its organization from its scope, or a route with a dependency that is no
+  parameter of its handler. Nothing says what such a route means for a platform administrator.
 
 ## 8. Admin → Users
 
@@ -622,7 +647,8 @@ ALTER TABLE orgs
 - **Each dialog** follows the limit dialog of #1841: while the data loads the action is off; after a
   failed read it says so and offers a retry; a retry shows that it runs.
 - **Admin → Users:** the column and the filter are in #1841. This work adds a mark beside the name of an
-  organization that is suspended, in the column and in the details of the account.
+  organization that is suspended, in the column and in the details of the account. The filter reads
+  `GET /admin/organizations` with no parameter, which answers as before (§6).
 - The Admin Console stays in English. No string of the sign-in pages changes.
 
 ## 13. Acceptance criteria
@@ -650,10 +676,10 @@ Each line is a behavior that can be observed. "Hand" says if the walk of §14 re
 | 17 | A save of the settings between the read and the write of the route: 409 `settings_changed`, and nothing is deleted. An attach or a change of the name between the checks and the transaction: 409 `organization_changed`, and nothing is deleted. Two deletes at the same time: one deletes, and the other gets a 404. A sign-in that waits for the delete makes no member | Database test with the settings store and two connections | No |
 | 18 | After a delete, an account that is made active again in **Admin → Users** is in no organization, and its keys stay revoked. A former member can have a password again, which a member cannot. When the connection is attached to a new organization, the accounts that match the member rule become members and stay suspended | Database test | No |
 | 19 | For one organization and one period, the list gives the spend, the requests, the members and the spend of this month that the Overview gives | Database test that reads both | Yes |
-| 20 | Totals, share, status counts, search by name and by domain, each sort in both orders, the pages, and `available_connections` | Database test | Yes |
-| 21 | The list runs the same number of statements for one organization and for twenty | Database test that counts statements | No |
-| 22 | Each read route of §7, except the audit log, returns the body that the organization route returns to an administrator of that organization. Each route of §7 answers 401, 403, 403 and 200 to no session, a member, an organization administrator and the platform administrator, and 404 for an unknown id. They answer for a suspended organization too | Database test | No |
-| 23 | A member action of the platform administrator writes an audit row with the `organization_id`. The organization administrator sees "Platform administrator" as the actor, and can restore a member that the platform administrator removed | Database test | Yes |
+| 20 | Totals, share, status counts, search by name and by domain, each sort in both orders, the pages, and `available_connections`. Without a period: each organization and not a page, no usage in a row or in the totals, and no read of the usage; an order by a figure of a period is refused | Database tests. Unit tests of the view: rows with one figure, an offset after the last row, nobody spent, and amounts in a ledger currency that is not USD | Yes |
+| 21 | The list runs the same number of statements for one organization and for twenty: five reads with a period, three without | Database test that counts the statements of the read in the store | No |
+| 22 | Each read route of §7, except the audit log, returns the body that the organization route returns to an administrator of that organization. Each route of §7 answers 401, 403, 403 and 200 to no session, a member, an organization administrator and the platform administrator, and 404 for an unknown id. They answer for a suspended organization too, reads and a write. A member of a different organization that is named below this one gets a 404. `ADMIN_TOKEN` is answered, and its writes name no account. The two sets of routes have the same parameters | Database tests. Unit test that compares each route of the two sets | No |
+| 23 | A member action of the platform administrator writes an audit row with the `organization_id`. The organization administrator sees "Platform administrator" as the actor, and can restore a member that the platform administrator removed. The platform administrator sees the account of the actor. The member is told that a platform administrator removed it | Database test | Yes |
 | 24 | `GET /admin/users` and the detail of an account have the status of the organization in `organization`: `suspended` after a suspend, `active` after a restore, and no organization after a delete | Database test | Yes |
 | 25 | **Admin → Users** marks an account of a suspended organization, in the column and in the details | Console test | No |
 | 26 | The tab shows the totals, the rows, the status tabs, the search and the sort. A new organization appears in the list | Console tests with a stubbed API | Yes |
@@ -696,19 +722,18 @@ administrator, as for #1829.
 
 ## 16. Delivery
 
-Three pull requests. Each one can be reviewed alone.
+Two pull requests. Each one can be reviewed alone.
 
-1. **Gateway, the status:** the revision, suspend, restore, delete with its write of the settings
-   (§5.2), the checks of §4.4 and §4.5, the
-   eviction, the audit actions, their tests, the operator guide and this record. This is the part that
-   decides who the gateway refuses, so it has no page and no list with it.
-2. **Gateway, the read side:** the list of §6, the routes of §7, the status of the organization in
-   `GET /admin/users` and their tests. It changes no check.
-3. **Console:** the tab, the pages of one organization, Settings, the mark in **Admin → Users**, and
+1. **Gateway:** the revision, suspend, restore, delete with its write of the settings (§5.2), the
+   checks of §4.4 and §4.5, the eviction, the audit actions, the list of §6, the routes of §7, the
+   status of the organization in `GET /admin/users`, their tests, the operator guide and this record.
+   Its commits keep the two parts apart: the part that decides who the gateway refuses, and the part
+   that gives the platform administrator the list and the pages of one organization.
+2. **Console:** the tab, the pages of one organization, Settings, the mark in **Admin → Users**, and
    their tests.
 
-Order: 1 needs #1840. 2 needs 1. 3 needs #1841 and 2. Between the merges nothing that a user sees
-changes, except that the routes of 1 and 2 answer.
+Order: 1 needs #1840. 2 needs #1841 and 1. Between the merges nothing that a user sees changes, except
+that the routes of 1 answer.
 
 ## 17. Alternatives considered
 
@@ -741,7 +766,7 @@ The author of the RFC answered these on 2026-11-21. No question is open.
 | # | Question | Decision |
 |---|---|---|
 | 1 | The base, while #1840 and #1841 are open | This work builds on their branches. It does not wait for the two merges |
-| 2 | Three pull requests or two | Three, as in §16 |
+| 2 | Three pull requests or two | Three at first. Decision 11 changed this to two (§16) |
 | 3 | The refusal of a key | The 403 that names the organization (§4.4), not the 401 of an invalid key |
 | 4 | The confirmation of a delete | The name, and the confirmation of the administrator. `ADMIN_TOKEN` is refused (§5.1) |
 | 5 | The connections after a delete | The delete turns the `SSO_PROVIDERS` entries off, so that a first sign-in makes no personal account. The request can keep them on (§5.2). The first proposal of this record kept them on |
@@ -756,3 +781,9 @@ that this record depends on. The author of the RFC decided these on the same day
 | 8 | A member signs in through single sign-on only | The password and the phone sign-in get no check of the organization (§4.5). The first text of this record had one at each |
 | 9 | A platform administrator is the `admin` role or an `ADMIN_EMAILS` address | The exemption of §4.2 uses the same rule. The first text of this record used the role only |
 | 10 | **Admin → Users** has the organization of an account, and the organization console has more pages and member actions | §8 adds only the status. §7 covers each route of the organization console. The figures of §6 are of the whole account, as #1840 made them |
+
+Later on 2026-11-23 the author of the RFC changed decision 2:
+
+| # | Question | Decision |
+|---|---|---|
+| 11 | Two gateway pull requests or one | One. The gateway is one pull request and the console is the second (§16) |

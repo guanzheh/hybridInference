@@ -116,7 +116,7 @@ The other calls:
 
 | Call | What it does |
 |---|---|
-| `GET /admin/organizations` | Lists the organizations: name, number of members, SSO connections, administrators, limits and the spend of this month |
+| `GET /admin/organizations` | Lists the organizations with the usage of a period. See [See each organization and its usage](#see-each-organization-and-its-usage) |
 | `GET /admin/organizations/{id}` | Shows one organization |
 | `PATCH /admin/organizations/{id}` | Changes `name` or `monthly_limit_usd`. `null` clears the limit |
 | `PUT /admin/organizations/{id}/connections/{provider_id}` | Attaches an SSO connection. Each account that matches the member rule and is in no organization becomes a member |
@@ -328,10 +328,79 @@ Things to know:
 ## The organization of an account in Admin
 
 **Admin → Users** shows the organization of each account. `GET /admin/users`
-has `organization` on each row: the id and the name of the organization, and
-the role of the account there, or `null`. `organization_id=<id>` keeps the
-members of one organization, and `organization_id=none` the accounts that have
-none. `GET /admin/users/{user_id}/detail` has the same field.
+has `organization` on each row: the id, the name and the status of the
+organization, and the role of the account there, or `null`.
+`organization_id=<id>` keeps the members of one organization, and
+`organization_id=none` the accounts that have none.
+`GET /admin/users/{user_id}/detail` has the same field.
+
+The account of a member of a suspended organization is `active` itself. The
+`status` of its organization shows the suspension.
+
+## See each organization and its usage
+
+`GET /admin/organizations` lists the organizations with the usage of a period:
+
+```bash
+curl -s "https://your-gateway.example/admin/organizations?period=7d&sort_by=spend&order=desc" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+| Parameter | Values |
+|---|---|
+| `period` | `1d`, `7d` or `30d`. Without it, the rows have no usage |
+| `status` | `all` (the default), `active` or `suspended` |
+| `search` | A part of the name of an organization, or of an email domain of its SSO connections |
+| `sort_by`, `order` | `name` (the default), `members`, `requests`, `spend` or `month_spend`; `asc` or `desc`. `requests` and `spend` need a `period` |
+| `limit`, `offset` | One page, of 200 organizations at most. Without `limit`, each organization |
+
+Each row has what `GET /admin/organizations/{id}` has, and `domains`: the
+email domains of its SSO connections. With `period`, a row also has:
+
+- `requests` and `cost_usd`: the requests and the spend of its members in the
+  period. A request that failed or cost nothing is counted too;
+- `spend_share`: its part of the spend of all organizations in the period,
+  from 0 to 1.
+
+Without `period` these are `null`, in each row and in `totals`, and the
+gateway does not read the usage.
+
+`totals` and `status_counts` are for all organizations. They do not change
+when `status` or `search` narrows the rows. `total` is the number of rows
+after the two. `available_connections` has the `SSO_PROVIDERS` entries that
+belong to no organization.
+
+The figures of a member are those of its whole account, also from before it
+joined. Only the spend of this month (`spent_month_usd`) starts when the
+account joins: it is the amount that the limit of the organization is
+compared with.
+
+### The pages of one organization
+
+Each route below `/user/organization` in
+[What an organization administrator sees](#what-an-organization-administrator-sees)
+and
+[What an organization administrator can change](#what-an-organization-administrator-can-change)
+also answers you below `/admin/organizations/{id}`, with the same parameters
+and the same answer. For example:
+
+```bash
+curl -s "https://your-gateway.example/admin/organizations/$ORGANIZATION_ID/members?period=30d" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+Things to know:
+
+- **The rules of the organization console apply.** A member action is not for
+  an organization administrator or for a platform administrator.
+- **What you do there is the action of the organization.** The audit log of
+  the organization records it with "Platform administrator" as the actor. The
+  organization can restore a member that you remove there, and the member is
+  told that a platform administrator removed it. To stop an account in a way
+  that the organization cannot undo, suspend it in **Admin → Users**.
+- **The audit log** at `/admin/organizations/{id}/audit-log` shows you the
+  account of a platform administrator. The organization does not see it.
+- **A suspended organization** can be read and changed through these routes.
 
 ## Suspend, restore and delete an organization
 
@@ -472,7 +541,7 @@ Things to know:
 Each action on this page writes a row to the audit log, with the organization
 it belongs to. You read the rows of one organization with
 `GET /admin/audit-log?organization_id=<id>`. An organization administrator
-reads the rows of its own organization. A row of yours names its actor
+reads the rows of its own organization. There a row of yours names its actor
 `platform_administrator`, without an account id or an email.
 
 | Action | Written when |
@@ -488,6 +557,10 @@ reads the rows of its own organization. A row of yours names its actor
 | `organization.member_key.revoke` | An organization administrator revokes an API key of a member |
 | `organization.suspend`, `organization.restore` | You suspend or restore an organization. A call that changes nothing writes no row |
 | `organization.delete` | You delete an organization. The row has the number of members, the number of accounts that were suspended, and the SSO connections |
+
+You can do the actions of an organization administrator too, through
+[the pages of one organization](#the-pages-of-one-organization). The row is
+the same, with you as the actor.
 
 A delete that switches `SSO_PROVIDERS` entries off also writes a
 `config.update` row, as a save in **Admin → Settings** does. That row belongs

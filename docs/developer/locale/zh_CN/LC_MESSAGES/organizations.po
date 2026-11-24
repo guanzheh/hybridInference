@@ -79,8 +79,8 @@ msgstr "作用"
 msgid "`GET /admin/organizations`"
 msgstr "`GET /admin/organizations`"
 
-msgid "Lists the organizations: name, number of members, SSO connections, administrators, limits and the spend of this month"
-msgstr "列出所有机构：名称、成员数、SSO 连接、管理员、上限和本月花费"
+msgid "Lists the organizations with the usage of a period. See [See each organization and its usage](#see-each-organization-and-its-usage)"
+msgstr "列出所有机构，以及它们在一段时间内的用量。见[查看每个机构及其用量](#see-each-organization-and-its-usage)"
 
 msgid "`GET /admin/organizations/{id}`"
 msgstr "`GET /admin/organizations/{id}`"
@@ -358,8 +358,8 @@ msgstr "**在非 USD 账本上**，用 `monthly_limit` 加 `currency` 以账本�
 msgid "The audit log"
 msgstr "审计日志"
 
-msgid "Each action on this page writes a row to the audit log, with the organization it belongs to. You read the rows of one organization with `GET /admin/audit-log?organization_id=<id>`. An organization administrator reads the rows of its own organization. A row of yours names its actor `platform_administrator`, without an account id or an email."
-msgstr "本页的每个操作都会在审计日志里写一行，并带上它所属的机构。你可以用 `GET /admin/audit-log?organization_id=<id>` 读某个机构的记录。机构管理员读本机构的记录。由你操作产生的记录，操作者是 `platform_administrator`，不带账号 id，也不带邮箱。"
+msgid "Each action on this page writes a row to the audit log, with the organization it belongs to. You read the rows of one organization with `GET /admin/audit-log?organization_id=<id>`. An organization administrator reads the rows of its own organization. There a row of yours names its actor `platform_administrator`, without an account id or an email."
+msgstr "本页的每个操作都会在审计日志里写一行，并带上它所属的机构。你可以用 `GET /admin/audit-log?organization_id=<id>` 读某个机构的记录。机构管理员读本机构的记录。在那里，由你操作产生的记录，操作者是 `platform_administrator`，不带账号 id，也不带邮箱。"
 
 msgid "Action"
 msgstr "操作"
@@ -505,8 +505,89 @@ msgstr "身份提供方停用账号时，网关不会得到通知。这个人此
 msgid "The organization of an account in Admin"
 msgstr "Admin 里账号所属的机构"
 
-msgid "**Admin → Users** shows the organization of each account. `GET /admin/users` has `organization` on each row: the id and the name of the organization, and the role of the account there, or `null`. `organization_id=<id>` keeps the members of one organization, and `organization_id=none` the accounts that have none. `GET /admin/users/{user_id}/detail` has the same field."
-msgstr "**Admin → Users** 显示每个账号所属的机构。`GET /admin/users` 的每一行带 `organization`：机构的 id 和名称，以及账号在其中的角色；不属于任何机构时为 `null`。`organization_id=<id>` 只保留某个机构的成员，`organization_id=none` 只保留不属于任何机构的账号。`GET /admin/users/{user_id}/detail` 也有这个字段。"
+msgid "**Admin → Users** shows the organization of each account. `GET /admin/users` has `organization` on each row: the id, the name and the status of the organization, and the role of the account there, or `null`. `organization_id=<id>` keeps the members of one organization, and `organization_id=none` the accounts that have none. `GET /admin/users/{user_id}/detail` has the same field."
+msgstr "**Admin → Users** 显示每个账号所属的机构。`GET /admin/users` 的每一行带 `organization`：机构的 id、名称和状态，以及账号在其中的角色；不属于任何机构时为 `null`。`organization_id=<id>` 只保留某个机构的成员，`organization_id=none` 只保留不属于任何机构的账号。`GET /admin/users/{user_id}/detail` 也有这个字段。"
+
+msgid "The account of a member of a suspended organization is `active` itself. The `status` of its organization shows the suspension."
+msgstr "被停用机构的成员，其账号本身仍是 `active`。它所属机构的 `status` 显示出这次停用。"
+
+msgid "See each organization and its usage"
+msgstr "查看每个机构及其用量"
+
+msgid "`GET /admin/organizations` lists the organizations with the usage of a period:"
+msgstr "`GET /admin/organizations` 列出所有机构，以及它们在一段时间内的用量："
+
+msgid "Parameter"
+msgstr "参数"
+
+msgid "Values"
+msgstr "取值"
+
+msgid "`period`"
+msgstr "`period`"
+
+msgid "`1d`, `7d` or `30d`. Without it, the rows have no usage"
+msgstr "`1d`、`7d` 或 `30d`。不给时，各行没有用量"
+
+msgid "`status`"
+msgstr "`status`"
+
+msgid "`all` (the default), `active` or `suspended`"
+msgstr "`all`（默认）、`active` 或 `suspended`"
+
+msgid "`search`"
+msgstr "`search`"
+
+msgid "A part of the name of an organization, or of an email domain of its SSO connections"
+msgstr "机构名称的一部分，或者它的 SSO 连接的某个邮箱域名的一部分"
+
+msgid "`sort_by`, `order`"
+msgstr "`sort_by`、`order`"
+
+msgid "`name` (the default), `members`, `requests`, `spend` or `month_spend`; `asc` or `desc`. `requests` and `spend` need a `period`"
+msgstr "`name`（默认）、`members`、`requests`、`spend` 或 `month_spend`；`asc` 或 `desc`。`requests` 和 `spend` 需要 `period`"
+
+msgid "`limit`, `offset`"
+msgstr "`limit`、`offset`"
+
+msgid "One page, of 200 organizations at most. Without `limit`, each organization"
+msgstr "一页，最多 200 个机构。不给 `limit` 时，返回每一个机构"
+
+msgid "Each row has what `GET /admin/organizations/{id}` has, and `domains`: the email domains of its SSO connections. With `period`, a row also has:"
+msgstr "每一行有 `GET /admin/organizations/{id}` 的全部内容，以及 `domains`：它的 SSO 连接的邮箱域名。给了 `period` 时，一行还有："
+
+msgid "`requests` and `cost_usd`: the requests and the spend of its members in the period. A request that failed or cost nothing is counted too;"
+msgstr "`requests` 和 `cost_usd`：它的成员在这段时间内的请求数和花费。失败的请求和不计费的请求也算在内；"
+
+msgid "`spend_share`: its part of the spend of all organizations in the period, from 0 to 1."
+msgstr "`spend_share`：它在这段时间内占所有机构花费的比例，从 0 到 1。"
+
+msgid "Without `period` these are `null`, in each row and in `totals`, and the gateway does not read the usage."
+msgstr "不给 `period` 时，各行里和 `totals` 里的这些都是 `null`，网关也不读取用量。"
+
+msgid "`totals` and `status_counts` are for all organizations. They do not change when `status` or `search` narrows the rows. `total` is the number of rows after the two. `available_connections` has the `SSO_PROVIDERS` entries that belong to no organization."
+msgstr "`totals` 和 `status_counts` 针对所有机构。`status` 或 `search` 缩小行的范围时，它们不变。`total` 是这两个条件筛选之后的行数。`available_connections` 是不属于任何机构的 `SSO_PROVIDERS` 条目。"
+
+msgid "The figures of a member are those of its whole account, also from before it joined. Only the spend of this month (`spent_month_usd`) starts when the account joins: it is the amount that the limit of the organization is compared with."
+msgstr "成员的数字是它整个账号的数字，加入之前的也算在内。只有本月花费（`spent_month_usd`）从账号加入时开始计：机构的上限就是和这个数额比较的。"
+
+msgid "The pages of one organization"
+msgstr "单个机构的页面"
+
+msgid "Each route below `/user/organization` in [What an organization administrator sees](#what-an-organization-administrator-sees) and [What an organization administrator can change](#what-an-organization-administrator-can-change) also answers you below `/admin/organizations/{id}`, with the same parameters and the same answer. For example:"
+msgstr "[机构管理员能看到什么](#what-an-organization-administrator-sees)和[机构管理员能修改什么](#what-an-organization-administrator-can-change)两节里 `/user/organization` 之下的每一个路由，在 `/admin/organizations/{id}` 之下也会回答你，参数相同，返回也相同。例如："
+
+msgid "**The rules of the organization console apply.** A member action is not for an organization administrator or for a platform administrator."
+msgstr "**机构控制台的规则同样适用**。成员操作不对机构管理员生效，也不对平台管理员生效。"
+
+msgid "**What you do there is the action of the organization.** The audit log of the organization records it with \"Platform administrator\" as the actor. The organization can restore a member that you remove there, and the member is told that a platform administrator removed it. To stop an account in a way that the organization cannot undo, suspend it in **Admin → Users**."
+msgstr "**你在这里做的，算作机构的操作**。机构的审计日志会记录它，操作者显示为“Platform administrator”。你在这里移除的成员，机构可以恢复，而这个成员会被告知是平台管理员移除了它。如果要用机构无法撤销的方式停掉一个账号，请在 **Admin → Users** 里停用它。"
+
+msgid "**The audit log** at `/admin/organizations/{id}/audit-log` shows you the account of a platform administrator. The organization does not see it."
+msgstr "`/admin/organizations/{id}/audit-log` 的**审计日志**会向你显示平台管理员的账号。机构看不到它。"
+
+msgid "**A suspended organization** can be read and changed through these routes."
+msgstr "**被停用的机构**可以通过这些路由读取和修改。"
 
 msgid "Suspend, restore and delete an organization"
 msgstr "停用、恢复和删除机构"
@@ -678,6 +759,9 @@ msgstr "`organization.delete`"
 
 msgid "You delete an organization. The row has the number of members, the number of accounts that were suspended, and the SSO connections"
 msgstr "你删除一个机构。记录里有成员数量、被停用的账号数量，以及它的 SSO 连接"
+
+msgid "You can do the actions of an organization administrator too, through [the pages of one organization](#the-pages-of-one-organization). The row is the same, with you as the actor."
+msgstr "机构管理员能做的操作，你也可以通过[单个机构的页面](#the-pages-of-one-organization)来做。写下的记录是一样的，操作者是你。"
 
 msgid "A delete that switches `SSO_PROVIDERS` entries off also writes a `config.update` row, as a save in **Admin → Settings** does. That row belongs to no organization. A delete that answered `delete_incomplete` can have switched the entries off without this row. The setting then still shows who changed it last."
 msgstr "关闭了 `SSO_PROVIDERS` 条目的删除还会写一条 `config.update` 记录，和在 **Admin → Settings** 里保存设置时一样。这条记录不属于任何机构。返回 `delete_incomplete` 的删除可能已经关闭了条目，却没有写这条记录。这种情况下，设置本身仍然记着最后是谁修改了它。"
