@@ -181,7 +181,7 @@ async def test_admin_users_shows_the_organization_of_an_account_and_filters_by_i
     of_another = await users("organization_id=o-no-such-organization")
     searched = await users(f"organization_id={organization_id}&search=bob")
 
-    here = {"id": organization_id, "name": "Example University"}
+    here = {"id": organization_id, "name": "Example University", "status": "active"}
     assert everyone[alice_id] == {**here, "role": "admin"}
     assert everyone[bob_id] == {**here, "role": "member"}
     assert everyone[outsider_id] is None

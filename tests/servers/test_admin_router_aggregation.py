@@ -46,8 +46,9 @@ def test_admin_router_has_expected_route_count() -> None:
     Bump this number deliberately when adding/removing admin routes.
     """
     # includes role-quota, provider-key verification/probe, key min-role (db+env), organizations
-    # (with suspend, restore and delete)
-    expected = 173
+    # (with suspend, restore and delete, and the 16 routes of the organization console
+    # for one organization: organizations/{organization_id}/overview, /members, ...)
+    expected = 189
     # (incl. disable/enable/enable-env and the by-ref disable/enable pair used
     # by the quota dashboard), visibility, concurrency,
     # global + per-model routewise settings/probes/decisions, routing-weight,

@@ -230,6 +230,17 @@ async def test_a_delete_suspends_the_members_removes_the_organization_and_switch
             bob_id,
         )
     assert dict(left) == {"members": 0, "connections": 0, "counters": 0, "usage": 1}
+    # Admin Users shows the accounts in no organization.
+    in_none = await root.get("/admin/users?organization_id=none", headers=headers)
+    shown = {user["id"]: user["organization"] for user in in_none.json()["users"]}
+    assert (shown[alice_id], shown[bob_id]) == (None, None)
+    detail = await root.get(f"/admin/users/{bob_id}/detail", headers=headers)
+    assert detail.json()["organization"] is None
+    # The list offers the connection of the deleted organization again, as switched off.
+    offered = (await root.get("/admin/organizations", headers=headers)).json()
+    assert {
+        entry["provider_id"]: entry["enabled"] for entry in offered["available_connections"]
+    } == {"example-univ": False, "example-staff": True}
     # The projects of the members stay as they were.
     async with clean_organizations.acquire() as conn:
         projects_after = await conn.fetch(

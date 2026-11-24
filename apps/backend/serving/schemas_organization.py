@@ -40,6 +40,16 @@ class OrganizationRef(BaseModel):
     role: MemberRole
 
 
+class AccountOrganization(OrganizationRef):
+    """The organization of an account, as the platform administrator is shown it.
+
+    With the status of the organization: an account of a suspended organization
+    is active itself, and the gateway refuses it.
+    """
+
+    status: OrganizationStatus = "active"
+
+
 class OrganizationConnection(BaseModel):
     """One SSO connection of an organization, without its secret or client id.
 
@@ -89,10 +99,67 @@ class OrganizationResponse(MoneyResponse):
     administrators: list[OrganizationAdministrator] = Field(default_factory=list)
 
 
-class ListOrganizationsResponse(BaseModel):
-    """Every organization of the deployment."""
+class OrganizationListItem(OrganizationResponse):
+    """One organization in the list of the platform administrator.
 
-    organizations: list[OrganizationResponse]
+    The usage is that of the period the list was asked for, and null in a list
+    that was asked for no period.
+    """
+
+    #: The email domains of its SSO connections.
+    domains: list[str] = Field(default_factory=list)
+    #: The logged requests of its members in the period, free and failed ones too.
+    requests: int | None = None
+    #: What its members spent in the period.
+    cost_usd: float | None = None
+    cost: Decimal | None = None
+    #: Its part of what all organizations spent in the period, from 0 to 1.
+    spend_share: float | None = None
+
+
+class OrganizationTotals(MoneyResponse):
+    """The figures over all organizations, whatever the list is narrowed to.
+
+    The requests and the spend are those of the period, and null in a list
+    that was asked for no period.
+    """
+
+    organizations: int = 0
+    members: int = 0
+    requests: int | None = None
+    cost_usd: float | None = None
+    cost: Decimal | None = None
+
+
+class OrganizationStatusCounts(BaseModel):
+    """How many organizations have each status, whatever the list is narrowed to."""
+
+    active: int = 0
+    suspended: int = 0
+
+
+class AvailableConnection(BaseModel):
+    """An ``SSO_PROVIDERS`` entry that belongs to no organization, and can be attached to one."""
+
+    provider_id: str
+    display_name: str | None = None
+    domains: list[str] = Field(default_factory=list)
+    enabled: bool = False
+
+
+class ListOrganizationsResponse(BaseModel):
+    """The organizations of the deployment, with the usage of a period when one was asked for.
+
+    ``total`` is the number of organizations after ``status`` and ``search``.
+    ``totals`` and ``status_counts`` are over all organizations.
+    """
+
+    organizations: list[OrganizationListItem]
+    total: int = 0
+    period: Period | None = None
+    totals: OrganizationTotals = Field(default_factory=OrganizationTotals)
+    status_counts: OrganizationStatusCounts = Field(default_factory=OrganizationStatusCounts)
+    available_connections: list[AvailableConnection] = Field(default_factory=list)
 
 
 class CreateOrganizationRequest(MoneyInput):
@@ -286,7 +353,8 @@ class OrganizationAuditEntry(BaseModel):
 
     ``actor`` is ``platform_administrator`` for a platform administrator,
     whose account an organization is not shown; ``member`` otherwise, with the
-    account in ``actor_user_id`` and ``actor_email``.
+    account in ``actor_user_id`` and ``actor_email``. A platform administrator
+    who reads the log is shown the account of a platform administrator too.
     """
 
     id: int

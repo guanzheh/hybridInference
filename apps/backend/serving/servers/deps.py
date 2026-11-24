@@ -734,19 +734,28 @@ def user_audit_actor(request: Request, current_user: dict[str, Any]) -> AuditAct
 
 @dataclass(frozen=True, slots=True)
 class OrganizationAdmin:
-    """An organization administrator a route admitted, and where it acts.
+    """Who a route of the organization console admitted, and the organization it acts in.
+
+    An organization administrator, in the organization of its own membership
+    (:func:`require_organization_admin`). Or, with ``for_platform``, a platform
+    administrator in the organization that the path names: each route of the
+    console is also served below ``/admin/organizations/{organization_id}``
+    (:mod:`serving.servers.routers.admin.organization_pages`).
 
     Attributes:
-        organization_id: The organization of the caller's own membership.
+        organization_id: The organization the caller acts in.
         organization_name: Its name, for the messages an action writes.
-        user_id: The caller's account.
+        user_id: The caller's account. None for the admin token, which has none.
         actor: The caller, as its audit rows record it.
+        for_platform: The caller is a platform administrator, and no
+            administrator of the organization.
     """
 
     organization_id: str
     organization_name: str
-    user_id: str
+    user_id: str | None
     actor: AuditActor
+    for_platform: bool = False
 
 
 async def require_organization_admin(

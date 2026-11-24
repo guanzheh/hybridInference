@@ -68,7 +68,7 @@ from serving.schemas_admin import (
     UsersSummaryResponse,
     UserTurnAverages,
 )
-from serving.schemas_organization import OrganizationRef
+from serving.schemas_organization import AccountOrganization
 from serving.servers.auth import log_admin_action
 from serving.servers.deps import (
     AppServices,
@@ -104,25 +104,27 @@ def _user_label(user_row: dict) -> str:
     )
 
 
-def _membership_ref(membership: Any) -> OrganizationRef | None:
+def _membership_ref(membership: Any) -> AccountOrganization | None:
     """The organization of an account, from its membership; None for none."""
     if not membership:
         return None
-    return OrganizationRef(
+    return AccountOrganization(
         id=membership["organization_id"],
         name=membership["organization_name"],
         role=membership["role"],
+        status=membership["organization_status"],
     )
 
 
-def _organization_of(row: Any) -> OrganizationRef | None:
+def _organization_of(row: Any) -> AccountOrganization | None:
     """The organization of an account, from a row that carries its membership; None for none."""
     if not row or not row.get("organization_id"):
         return None
-    return OrganizationRef(
+    return AccountOrganization(
         id=row["organization_id"],
         name=row["organization_name"],
         role=row["organization_role"],
+        status=row["organization_status"],
     )
 
 

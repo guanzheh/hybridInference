@@ -13,9 +13,9 @@ so a restore brings everything back. A delete cannot be undone.
 from __future__ import annotations
 
 from functools import partial
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from serving import organizations
 from serving.accounting import get_accounting_policy
@@ -31,6 +31,7 @@ from serving.schemas_organization import (
     OrganizationDeletedResponse,
     OrganizationMessageResponse,
     OrganizationResponse,
+    Period,
     SetMemberRoleRequest,
     UpdateOrganizationRequest,
 )
@@ -51,6 +52,9 @@ from serving.utils.logging import get_logger
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/admin")
+
+#: What the list can be ordered by: the keys of ``organizations.ORGANIZATION_ORDER``.
+OrganizationOrder = Literal["name", "members", "requests", "spend", "month_spend"]
 
 
 def _refusal(status_code: int, code: str, message: str) -> HTTPException:
@@ -93,15 +97,45 @@ def _provider(provider_id: str) -> Any:
 
 @router.get("/organizations", response_model=ListOrganizationsResponse)
 async def list_organizations(
+    period: Period | None = None,
+    status: Literal["all", "active", "suspended"] = "all",
+    search: str | None = Query(default=None, max_length=200),
+    sort_by: OrganizationOrder = "name",
+    order: Literal["asc", "desc"] = "asc",
+    limit: int | None = Query(default=None, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
     _admin_id: str = Depends(verify_admin_access),
     op_store=Depends(get_operational_store),
 ) -> ListOrganizationsResponse:
-    """Every organization of the deployment, by name."""
-    store = _store(op_store)
-    rows = await store.list_organizations()
-    return ListOrganizationsResponse(
-        organizations=[await _organization(store, row["id"]) for row in rows]
+    """The organizations of the deployment, with the usage of a period when one is asked for.
+
+    Each row has what ``GET /admin/organizations/{id}`` has and the email
+    domains of its connections. With ``period``, it also has the requests and
+    the spend of its members in that period and its share of the spend of all
+    organizations. Without ``period`` these are null and the usage is not
+    read: a caller that wants the organizations for a filter sends none.
+
+    ``search`` finds a part of a name or of a domain. ``totals`` and
+    ``status_counts`` are over all organizations and do not follow ``status``
+    or ``search``. ``available_connections`` has the ``SSO_PROVIDERS`` entries
+    that belong to no organization. Without ``limit``, every row.
+
+    Raises:
+        HTTPException: 400 for an order by requests or by spend without a period.
+    """
+    if period is None and sort_by in organizations.ORDERS_OF_A_PERIOD:
+        raise HTTPException(400, f"Send a period to order by {sort_by}.")
+    view = await organizations.organizations_view(
+        _store(op_store),
+        period,
+        status=None if status == "all" else status,
+        search=search,
+        sort_by=sort_by,
+        descending=order == "desc",
+        limit=limit,
+        offset=offset,
     )
+    return ListOrganizationsResponse(**view)
 
 
 @router.post("/organizations", response_model=OrganizationCreatedResponse, status_code=201)

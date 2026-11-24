@@ -25,6 +25,7 @@ from serving.accounting import get_accounting_policy
 from serving.audit import AuditTarget, audit_columns
 from serving.config.settings import admin_email_addresses
 from serving.model_access import normalize_disabled_models
+from serving.storage import user_usage_rollup
 from serving.storage.audit_schema import insert_audit_row
 
 if TYPE_CHECKING:
@@ -133,7 +134,8 @@ _ORGANIZATION_SELECT = (
 
 _MEMBERSHIP_SELECT = (
     "SELECT m.user_id, m.organization_id, m.role, m.joined_at, m.removed_at, m.removed_by, "
-    "m.disabled_models, o.name AS organization_name, u.role AS account_role "
+    "m.disabled_models, o.name AS organization_name, o.status AS organization_status, "
+    "u.role AS account_role "
     "FROM org_memberships m JOIN orgs o ON o.id = m.organization_id "
     "JOIN users u ON u.id = m.user_id "
 )
@@ -284,6 +286,12 @@ _AMOUNT = "COALESCE(c.cost_amount, c.cost_usd * $2::numeric)"
 _LOG_AMOUNT = "COALESCE(l.cost_amount, l.cost_usd * $2::numeric)"
 
 _THIS_MONTH = "to_char(date_trunc('month', NOW() AT TIME ZONE 'UTC'), 'YYYY-MM-DD')"
+
+#: The logged requests of each member of any organization in a span of UTC
+#: days (``$1``, ``$2``), from the rollup behind the Admin user list.
+_MEMBER_REQUEST_COUNTS = user_usage_rollup.request_counts_sql(
+    "IN (SELECT user_id FROM org_memberships)"
+)
 
 
 def contains_pattern(text: str) -> str:
@@ -686,11 +694,96 @@ class PostgresOrganizationsMixin:
             row = await conn.fetchrow(_ORGANIZATION_SELECT + "WHERE o.id = $1", organization_id)
         return dict(row) if row else None
 
-    async def list_organizations(self) -> list[dict]:
-        """Every organization, by name."""
+    async def list_organizations(
+        self, *, first_day: date | None = None, last_day: date | None = None
+    ) -> list[dict]:
+        """Every organization, by name, with the usage of a span of UTC days when one is given.
+
+        Each row has the organization with its member count and the ids of its
+        SSO connections, and with them:
+
+        - ``spent_month_usd`` and ``spent_month_amount``: its counter for this
+          UTC month, the row its limit is checked against;
+        - ``administrators``: its members with the administrator role.
+
+        With *first_day* and *last_day*, also the usage of its members in that
+        span:
+
+        - ``cost_usd`` and ``cost_amount``: what they spent, from the cost
+          counters (``user_daily_cost``), as :meth:`get_organization_usage`
+          sums them for one organization;
+        - ``requests``: their logged requests, free and failed ones too, from
+          the rollup behind the Admin user list
+          (:func:`serving.storage.user_usage_rollup.request_counts_sql`). The
+          request log is read only for the days the rollup does not hold.
+
+        One read for each of these and one for the organizations: three, or
+        five with a span. The number does not grow with the number of
+        organizations.
+        """
+        rate = get_accounting_policy().usd_to_currency_rate
+        spent: list[Any] = []
+        asked: list[Any] = []
         async with self._pool.acquire() as conn:
-            rows = await conn.fetch(_ORGANIZATION_SELECT + "ORDER BY lower(o.name), o.id")
-        return [dict(row) for row in rows]
+            organizations = [
+                dict(row)
+                for row in await conn.fetch(_ORGANIZATION_SELECT + "ORDER BY lower(o.name), o.id")
+            ]
+            if first_day is not None and last_day is not None:
+                spent = await conn.fetch(
+                    "SELECT m.organization_id, SUM(c.cost_usd) AS cost_usd, "
+                    f"SUM({_AMOUNT}) AS cost_amount "
+                    "FROM user_daily_cost c JOIN org_memberships m ON m.user_id = c.user_id "
+                    "WHERE c.day >= $1 AND c.day <= $3 GROUP BY m.organization_id",
+                    first_day.isoformat(),
+                    rate,
+                    last_day.isoformat(),
+                )
+                async with conn.transaction():
+                    await conn.execute(user_usage_rollup.NO_JIT_SQL)
+                    asked = await conn.fetch(
+                        "SELECT m.organization_id, SUM(r.request_count)::bigint AS requests "
+                        f"FROM ({_MEMBER_REQUEST_COUNTS}) r "
+                        "JOIN org_memberships m ON m.user_id = r.user_id "
+                        "GROUP BY m.organization_id",
+                        first_day,
+                        last_day,
+                    )
+            month = await conn.fetch(
+                f"SELECT c.scope_id, c.cost_usd, {_AMOUNT} AS cost_amount "
+                "FROM spend_counters c WHERE c.scope_id = ANY($1::text[]) "
+                "AND c.period = 'm:' || to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM')",
+                [organization_scope(row["id"]) for row in organizations],
+                rate,
+            )
+            administrators = await conn.fetch(
+                "SELECT m.organization_id, m.user_id, u.email, u.user_name, u.last_login_at "
+                "FROM org_memberships m JOIN users u ON u.id = m.user_id "
+                "WHERE m.role = 'admin' "
+                "ORDER BY lower(COALESCE(u.email, '')), m.user_id"
+            )
+        spent_by = {row["organization_id"]: row for row in spent}
+        asked_by = {row["organization_id"]: row["requests"] for row in asked}
+        month_by = {row["scope_id"]: row for row in month}
+        administrators_by: dict[str, list[dict]] = {}
+        for row in administrators:
+            person = dict(row)
+            administrators_by.setdefault(person.pop("organization_id"), []).append(person)
+        for row in organizations:
+            counter = month_by.get(organization_scope(row["id"]))
+            row.update(
+                spent_month_usd=counter["cost_usd"] if counter else 0,
+                spent_month_amount=counter["cost_amount"] if counter else 0,
+                administrators=administrators_by.get(row["id"], []),
+            )
+            if first_day is not None and last_day is not None:
+                period = spent_by.get(row["id"])
+                row.update(
+                    cost_usd=period["cost_usd"] if period else 0,
+                    cost_amount=period["cost_amount"] if period else 0,
+                    requests=int(asked_by.get(row["id"]) or 0),
+                )
+        return organizations
 
     async def rename_organization(
         self, organization_id: str, name: str, *, actor: AuditActor

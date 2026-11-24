@@ -9,6 +9,13 @@ A member in a path must belong to the caller's organization; any other account
 answers 404, as one that does not exist would.
 
 No route returns the content of a request or the value of an API key.
+
+Each route here but the first is also served to a platform administrator,
+below ``/admin/organizations/{organization_id}``, by the same handler
+(:mod:`serving.servers.routers.admin.organization_pages`). There the
+organization is the one the path names, and ``admin.for_platform`` is true. So
+a handler takes its organization and its actor from ``admin`` and from nowhere
+else, and a route added here is an Admin route too.
 """
 
 from __future__ import annotations
@@ -68,7 +75,7 @@ MemberOrder = Literal[
 MemberStatus = Literal["active", "suspended", "removed", "pending_approval"]
 AuditCategory = Literal["membership", "limits", "access", "organization"]
 
-_NOT_A_MEMBER = "This account is not a member of your organization."
+_NOT_A_MEMBER = "This account is not a member of this organization."
 _ABOVE_LIMIT = "A member's limit cannot be greater than the limit of the organization."
 
 
@@ -200,7 +207,7 @@ async def get_member(
     """One member: its usage, its spend for each of the last 30 days, its last requests.
 
     Raises:
-        HTTPException: 404 when the account is not a member of the caller's organization.
+        HTTPException: 404 when the account is not a member of the organization.
     """
     view = await organizations.member_detail_view(op_store, admin.organization_id, user_id, period)
     if view is None:
@@ -221,13 +228,15 @@ async def remove_member(
     administrator, of the organization or of the platform.
 
     Raises:
-        HTTPException: 404 when the account is not a member of the caller's
+        HTTPException: 404 when the account is not a member of the
             organization; 409 for an administrator, or an account that is not active.
     """
+    # What the member is told at its next sign-in: who removed it.
+    by = "a platform administrator" if admin.for_platform else "its administrator"
     outcome = await op_store.remove_organization_member(
         admin.organization_id,
         user_id,
-        suspension_message=f"Removed from {admin.organization_name} by its administrator.",
+        suspension_message=f"Removed from {admin.organization_name} by {by}.",
         actor=admin.actor,
     )
     if outcome == org_store.NOT_FOUND:
@@ -250,7 +259,7 @@ async def restore_member(
     The revoked API keys stay revoked: the member makes new ones.
 
     Raises:
-        HTTPException: 404 when the account is not a member of the caller's
+        HTTPException: 404 when the account is not a member of the
             organization; 409 when the organization did not remove it (an
             account a platform administrator suspended is theirs to restore).
     """
@@ -285,7 +294,7 @@ async def set_member_monthly_limit(
 
     Raises:
         HTTPException: 400 when the limit is above the organization's own;
-            404 when the account is not a member of the caller's
+            404 when the account is not a member of the
             organization; 409 for an administrator.
     """
     usd, native = _limit(payload)
@@ -304,10 +313,10 @@ async def set_member_monthly_limit(
 
 
 async def _member_account(op_store: Any, admin: OrganizationAdmin, user_id: str) -> dict[str, Any]:
-    """The account row of a member of the caller's organization.
+    """The account row of a member of the organization.
 
     Raises:
-        HTTPException: 404 when the account is not a member of the caller's organization.
+        HTTPException: 404 when the account is not a member of the organization.
     """
     membership = await organizations.membership_of(op_store, user_id)
     account = await op_store.get_user_by_id(user_id) if membership else None
@@ -357,7 +366,7 @@ async def get_member_models(
     """The models the organization can turn off for a member, and those that are off.
 
     Raises:
-        HTTPException: 404 when the account is not a member of the caller's organization.
+        HTTPException: 404 when the account is not a member of the organization.
     """
     return await _member_models(
         await _member_account(op_store, admin, user_id),
@@ -387,7 +396,7 @@ async def set_member_models(
     a deployment has beyond those. Not for an administrator.
 
     Raises:
-        HTTPException: 404 when the account is not a member of the caller's
+        HTTPException: 404 when the account is not a member of the
             organization; 409 for an administrator.
     """
     sources = {
@@ -422,7 +431,7 @@ async def revoke_member_key(
     The key stays revoked: the member makes a new one. Not for an administrator.
 
     Raises:
-        HTTPException: 404 when the account is not a member of the caller's
+        HTTPException: 404 when the account is not a member of the
             organization, or the key is not that member's; 409 for an
             administrator, or a key that is not active.
     """
@@ -569,7 +578,7 @@ async def list_audit_log(
     admin: OrganizationAdmin = Depends(require_organization_admin),
     op_store=Depends(get_operational_store),
 ) -> ListOrganizationAuditResponse:
-    """The management actions of the caller's organization, newest first.
+    """The management actions of the organization, newest first.
 
     ``member`` keeps the rows that have that account as target or as actor.
     Each entry has its details in full: for a change, the old value and the
@@ -585,5 +594,6 @@ async def list_audit_log(
             search=search,
             limit=limit,
             offset=offset,
+            for_platform=admin.for_platform,
         )
     )

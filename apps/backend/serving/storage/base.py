@@ -326,8 +326,8 @@ class OperationalStore(ABC):
         """One organization with its member count and the ids of its SSO connections."""
         raise OrganizationsUnavailableError
 
-    async def list_organizations(self) -> list[Row]:
-        """Every organization, by name."""
+    async def list_organizations(self, **fields: Any) -> list[Row]:
+        """Every organization, by name, with the usage of a span of UTC days when one is given."""
         raise OrganizationsUnavailableError
 
     async def rename_organization(self, organization_id: str, name: str, **fields: Any) -> str:
@@ -746,8 +746,8 @@ class OperationalStore(ABC):
           today/month spend meets the threshold (USD).
         - ``organization_id``: keep the members of one organization, or with
           ``"none"`` the accounts in no organization. Each row has
-          ``organization_id``, ``organization_name`` and ``organization_role``,
-          NULL for an account in none.
+          ``organization_id``, ``organization_name``, ``organization_status``
+          and ``organization_role``, NULL for an account in none.
         - ``quota_state``: ``"default"``/``"custom"`` filter on the user's
           active key quota; ``"near"``/``"over"`` compare today's spend
           against quota.

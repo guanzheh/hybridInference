@@ -1912,7 +1912,7 @@ class PostgresOperationalStore(
                 f"  k.key_prefix, k.status AS key_status, "
                 # The organization the account is a member of, if it is one.
                 f"  om.organization_id, o.name AS organization_name, "
-                f"  om.role AS organization_role "
+                f"  o.status AS organization_status, om.role AS organization_role "
                 f"  FROM users u "
                 f"  LEFT JOIN org_memberships om ON om.user_id = u.id "
                 f"  LEFT JOIN orgs o ON o.id = om.organization_id "

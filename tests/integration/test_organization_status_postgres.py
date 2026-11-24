@@ -361,6 +361,34 @@ async def test_an_address_of_admin_emails_is_not_refused_while_its_role_is_not_a
     assert (await store.get_user_by_id(dave_id))["role"] == "admin"
 
 
+async def test_admin_users_has_the_status_of_the_organization_of_an_account(
+    app, idp, store, members_sign_straight_in
+):
+    """The account of a member stays active: its organization says why it is refused."""
+    state = await _organization_with_an_administrator(app, idp, store)
+    root, headers = state["root"]
+    bob_id = state["bob"][2]
+
+    async def shown() -> tuple[str, str, str]:
+        listed = await root.get(
+            f"/admin/users?organization_id={state['organization_id']}", headers=headers
+        )
+        detail = await root.get(f"/admin/users/{bob_id}/detail", headers=headers)
+        assert (listed.status_code, detail.status_code) == (200, 200), listed.text
+        [row] = [user for user in listed.json()["users"] if user["id"] == bob_id]
+        return row["status"], row["organization"]["status"], detail.json()["organization"]["status"]
+
+    assert await shown() == ("active", "active", "active")
+
+    await _suspend(state)
+
+    assert await shown() == ("active", "suspended", "suspended")
+
+    await _suspend(state, "restore")
+
+    assert await shown() == ("active", "active", "active")
+
+
 # -- a session ----------------------------------------------------------------------
 
 

@@ -1266,9 +1266,9 @@ class CachedOperationalStore(OperationalStore):
         """One organization with its member count and the ids of its SSO connections."""
         return await self._store.get_organization(organization_id)
 
-    async def list_organizations(self) -> list[Row]:
-        """Every organization, by name."""
-        return await self._store.list_organizations()
+    async def list_organizations(self, **fields: Any) -> list[Row]:
+        """Every organization, by name, with the usage of a span of UTC days when one is given."""
+        return await self._store.list_organizations(**fields)
 
     async def rename_organization(self, organization_id: str, name: str, **fields: Any) -> str:
         """Give an organization another name, then evict the cached auth entries."""
