@@ -12,10 +12,12 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any
 
+from serving.storage.base import OrganizationSuspendedError
 from serving.storage.organizations import (
     in_other_organization,
     join_organization,
     lock_for_sign_in,
+    refused_by_connection,
 )
 
 if TYPE_CHECKING:
@@ -100,7 +102,8 @@ class PostgresSsoMixin:
         identity), ``"identity_in_use"`` when another account holds it,
         ``"issuer_conflict"`` when this account already holds a different
         identity from the same issuer, ``"inactive"`` when the account is
-        missing or not active, and ``"other_organization"`` when the provider
+        missing or not active, or the provider belongs to an organization that
+        is suspended for it, and ``"other_organization"`` when the provider
         belongs to an organization and the account to another one. The account
         row is locked first, so a link is never written to an account a
         concurrent suspension or deletion is closing.
@@ -111,13 +114,23 @@ class PostgresSsoMixin:
         """
         async with self._pool.acquire() as conn, conn.transaction():
             await lock_for_sign_in(conn)
-            status = await conn.fetchval(
-                "SELECT status FROM users WHERE id = $1 FOR UPDATE", user_id
+            account = await conn.fetchrow(
+                "SELECT status, role, email FROM users WHERE id = $1 FOR UPDATE", user_id
             )
-            if status != "active":
+            if account is None or account["status"] != "active":
                 return ACCOUNT_INACTIVE
             if await in_other_organization(conn, user_id=user_id, provider_id=provider_id):
                 return OTHER_ORGANIZATION
+            if await refused_by_connection(
+                conn,
+                provider_id=provider_id,
+                account_role=account["role"],
+                account_email=account["email"],
+            ):
+                # The link would make the account a member of a suspended
+                # organization, which then refuses it: the account is told
+                # what an account that is not active is told.
+                return ACCOUNT_INACTIVE
             row = await conn.fetchrow(
                 "INSERT INTO user_identities (id, user_id, provider_id, issuer, subject, email) "
                 "VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING RETURNING id",
@@ -213,12 +226,21 @@ class PostgresSsoMixin:
 
         When the provider belongs to an organization, the account is created
         as its member.
+
+        Raises:
+            OrganizationSuspendedError: The provider belongs to a suspended
+                organization. No account is made: it would be a member that
+                the organization refuses.
         """
         from serving.storage.project_backfill import ensure_default_project
 
         try:
             async with self._pool.acquire() as conn, conn.transaction():
                 await lock_for_sign_in(conn)
+                if await refused_by_connection(
+                    conn, provider_id=provider_id, account_role=role, account_email=email
+                ):
+                    raise OrganizationSuspendedError
                 row = await conn.fetchrow(
                     "INSERT INTO users (id, email, password_hash, user_name, "
                     "email_verified, status, role) VALUES ($1, $2, NULL, $3, TRUE, $4, $5) "

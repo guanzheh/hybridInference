@@ -88,7 +88,7 @@ from serving.storage.pools import SingleConnectionPool
 from serving.utils.logging import get_logger
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Sequence
     from datetime import datetime
 
 logger = get_logger(__name__)
@@ -165,6 +165,16 @@ _KEY_SHARING_SURFACES = (SURFACE_OPENAI_INLINE, SURFACE_OPENAI_FILE)
 TARGET_CHAT = "chat"
 TARGET_EMBEDDINGS = "embeddings"
 TARGET_MESSAGES = "messages"
+
+#: ``paused_reason`` of the batches of an owner whose organization is suspended.
+#: The worker sets it, and a restore of the organization lifts the pauses that
+#: carry it (``clear_user_batch_pauses``).
+PAUSE_ORGANIZATION_SUSPENDED = "organization_suspended"
+#: How long such a pause lasts when no restore lifts it: the key is checked
+#: again after it. Short, because a restore can miss a pause: its second step
+#: can fail, and a worker that read the status just before the restore writes
+#: its pause just after. Either costs this much at most.
+ORGANIZATION_PAUSE_SECONDS = 300.0
 TARGET_RESPONSES = "responses"
 
 #: Version 1: batches stored before surfaces and phases existed (every one an
@@ -2813,9 +2823,10 @@ class BatchStore:
     ) -> int:
         """Hold a user's validating and in-progress batches back from claims until *until*.
 
-        ``reason`` (``quota``, ``monthly_quota``, ``role``, ``key_budget`` or
-        ``project_budget``) is what the console shows. With ``key_hash``, only the
-        batches created with that API key.
+        ``reason`` (``quota``, ``monthly_quota``, ``role``, ``key_budget``,
+        ``project_budget`` or :data:`PAUSE_ORGANIZATION_SUSPENDED`) is what the
+        console shows. With ``key_hash``, only the batches created with that
+        API key.
 
         Returns:
             The number of batches paused.
@@ -2836,6 +2847,35 @@ class BatchStore:
                 until,
                 reason,
                 key_hash,
+            )
+        return _rowcount(result)
+
+    async def clear_user_batch_pauses(self, user_ids: Sequence[str], reason: str) -> int:
+        """Lift the pause of every batch of *user_ids* that is paused for *reason*.
+
+        For a pause whose cause was removed, so that the batches do not wait
+        for it to run out: a restore of the organization of these accounts. A
+        batch paused for another reason stays paused.
+
+        Returns:
+            The number of batches that continue.
+        """
+        if not user_ids:
+            return 0
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE batch_jobs SET paused_until = NULL, paused_reason = NULL
+                WHERE id IN (
+                    SELECT id FROM batch_jobs
+                    WHERE user_id = ANY($1::text[]) AND paused_reason = $2
+                      AND paused_until IS NOT NULL
+                    ORDER BY id
+                    FOR NO KEY UPDATE
+                )
+                """,
+                list(user_ids),
+                reason,
             )
         return _rowcount(result)
 

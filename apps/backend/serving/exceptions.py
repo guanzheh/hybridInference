@@ -158,6 +158,17 @@ class APIKeyLimitReachedError(UserFacingError):
         super().__init__(f"An account may hold at most {limit} active API keys")
 
 
+class KeyOwnerSuspendedError(UserFacingError):
+    """The account is suspended, so it gets no new API key."""
+
+    #: What a route answers with. Fixed text: a response never carries the
+    #: text of an exception.
+    MESSAGE = "This account is suspended and cannot be given an API key."
+
+    def __init__(self) -> None:
+        super().__init__(self.MESSAGE)
+
+
 class AmbiguousAPIKeyError(UserFacingError):
     """The account holds several active API keys and the request named none."""
 

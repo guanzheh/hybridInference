@@ -22,6 +22,7 @@ import pytest_asyncio
 from serving.storage import batch_store
 from serving.storage.batch_store import (
     ACTIVE_BATCH_STATUSES,
+    PAUSE_ORGANIZATION_SUSPENDED,
     TERMINAL_BATCH_STATUSES,
     BatchDeleteInProgress,
     BatchOwnerUnavailable,
@@ -1462,6 +1463,37 @@ async def test_pausing_by_key_holds_back_only_that_keys_batches(store):
     assert (await store.get_batch(spent["id"]))["paused_until"] == until
     assert (await store.get_batch(other["id"]))["paused_until"] is None
     assert [item["batch_id"] for item in await _claim(store, model)] == [other["id"]]
+
+
+async def test_a_pause_is_lifted_for_one_reason_and_for_the_users_given(store):
+    """A restore of an organization: its members' batches continue, and no others."""
+    model = _model()
+    suspended = PAUSE_ORGANIZATION_SUSPENDED
+    until = datetime.now(UTC) + timedelta(hours=1)
+    waiting = await _create(store, _items(model, 1), user="erin")
+    second = await _create(store, _items(model, 1), user="dave")
+    other_reason = await _create(store, _items(model, 1), user="carol")
+    other_user = await _create(store, _items(model, 1), user="bob")
+    for user in ("erin", "dave", "bob"):
+        assert await store.pause_user_batches(user, until, suspended) == 1
+    assert await store.pause_user_batches("carol", until, "monthly_quota") == 1
+    assert await _claim(store, model) == []
+
+    # Carol is paused for her own quota, and Bob is not one of the users given.
+    lifted = await store.clear_user_batch_pauses(["erin", "dave", "carol"], suspended)
+
+    assert lifted == 2
+    for batch in (waiting, second):
+        row = await store.get_batch(batch["id"])
+        assert (row["paused_until"], row["paused_reason"]) == (None, None)
+    assert (await store.get_batch(other_reason["id"]))["paused_reason"] == "monthly_quota"
+    assert (await store.get_batch(other_user["id"]))["paused_until"] == until
+    # They are claimed at the next pass: they do not wait for the pause to run out.
+    claimed = {item["batch_id"] for item in await _claim(store, model)}
+    assert claimed == {waiting["id"], second["id"]}
+    # Nothing left to lift, and nobody to lift it for.
+    assert await store.clear_user_batch_pauses(["erin", "dave"], suspended) == 0
+    assert await store.clear_user_batch_pauses([], suspended) == 0
 
 
 # -- sweep ---------------------------------------------------------------------
