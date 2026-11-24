@@ -22,6 +22,7 @@ from serving.config.settings import get_settings, has_role
 from serving.config.site_identity import get_site_identity
 from serving.grant_auth import (
     AgentModelAuthError,
+    AgentOrganizationSuspended,
     AgentQuotaExceeded,
     authenticate_grant_model_call,
 )
@@ -45,6 +46,7 @@ from serving.servers.deps import (
     auth_database_detail,
     get_log_store,
     get_operational_store,
+    refuse_suspended_organization,
 )
 from serving.spend_ledger import SPEND_CHECK_KEY, SpendCheck, ledger_for
 from serving.storage.base import OperationalStore
@@ -120,6 +122,22 @@ class StoredKeyRejected(Exception):
         """Record why the key was refused."""
         super().__init__(reason)
         self.reason = reason
+
+
+class StoredKeyOrganizationSuspended(Exception):
+    """The owner of a stored API key is a member of a suspended organization.
+
+    Raised by :func:`authenticate_stored_key`, and not as
+    :class:`StoredKeyRejected`: that one says the key will never work again,
+    and work stored under it is failed. A suspension is undone by a restore,
+    so the work waits. ``organization`` is the organization, as
+    :func:`serving.organizations.suspended_in` gives it.
+    """
+
+    def __init__(self, organization: dict[str, Any]) -> None:
+        """Record the organization that refuses the owner."""
+        super().__init__(organizations.suspended_message(organization))
+        self.organization = organization
 
 
 class StoredKeyQuotaExceeded(Exception):
@@ -268,7 +286,9 @@ def _credential_state(row: dict[str, Any]) -> str:
 
     One short string for the rejection log: ``"user_<status>"`` when the
     account itself is not active, otherwise the key's own status when it is not
-    active (``"revoked"``), ``"expired"`` past its deadline, or ``"active"``.
+    active (``"revoked"``), ``"expired"`` past its deadline,
+    ``"organization_suspended"`` for a live key of a member of a suspended
+    organization, or ``"active"``.
     Single-valued on purpose, so an operator can query these rows by equality;
     what it names is the blocker to clear first.
 
@@ -293,6 +313,10 @@ def _credential_state(row: dict[str, Any]) -> str:
         return key_status or "unknown"
     if row.get("key_expired"):
         return "expired"
+    if row.get("organization_suspended"):
+        # The key and its account are live, and the organization of the
+        # account is suspended for it: the blocker to clear is the suspension.
+        return organizations.SUSPENDED_CODE
     return "active"
 
 
@@ -368,6 +392,40 @@ async def _identify_rejected_caller(
         "authenticated": state == "active",
         "credential_state": state,
     }
+
+
+def _refuse_suspended_organization(request: Request, identity: dict[str, Any]) -> None:
+    """Refuse a key whose account its suspended organization refuses.
+
+    *identity* is the row a key lookup returned, or the identity a request is
+    charged to. Returns when it names no suspended organization
+    (:func:`serving.organizations.suspended_in`); otherwise the refusal is
+    written to the rejection log and the 403 every surface gives is raised
+    (:func:`serving.servers.deps.refuse_suspended_organization`).
+
+    Not an authentication failure: the key is a live key of its account, so the
+    refusal does not count toward the IP block. A member that keeps calling
+    with a good key must not get the address of its institution blocked.
+    """
+    organization = organizations.suspended_in(identity)
+    if organization is None:
+        return
+    detached_tasks.rejection_log(  # its row is written after the 4xx is sent
+        log_rejection(
+            request=request,
+            status_code=403,
+            error_code=organizations.SUSPENDED_CODE,
+            reason=f"organization_id={organization['organization_id']}",
+            user={
+                "user_id": identity.get("user_id"),
+                "role": identity.get("role") or "free",
+                # A live key of this account made the request.
+                "authenticated": True,
+                "credential_state": organizations.SUSPENDED_CODE,
+            },
+        )
+    )
+    refuse_suspended_organization(organization)
 
 
 async def _auth_context_with_spend(
@@ -841,7 +899,9 @@ async def _authenticate_by_api_key(
     caller's daily spend when ``want_spend`` was set (the quota gate reads it
     when the attributed identity is the caller) and ``None`` otherwise. Raises
     ``HTTPException(401)`` for a
-    missing/invalid key and ``HTTPException(403)`` for an unverified email.
+    missing/invalid key and ``HTTPException(403)`` for an unverified email, and
+    for an account whose organization is suspended
+    (:func:`_refuse_suspended_organization`).
     """
     # Refuse sources already blocked for repeated auth failures. The *decision*
     # costs no key extraction and no DB lookup, so a flood is shed cheaply.
@@ -1023,6 +1083,10 @@ async def _authenticate_by_api_key(
             detail="Invalid or expired API key",
         )
 
+    # Before anything is done for the account: every route that takes a key
+    # comes through here, also the ones that spend nothing.
+    _refuse_suspended_organization(request, user)
+
     if await _verification_pending(user):
         raise HTTPException(
             status_code=403,
@@ -1072,6 +1136,10 @@ async def _resolve_effective_identity(
     a missing/blank target, an unknown or non-active user, or a store miss — so
     the header can never misattribute a request to a user the caller could not
     otherwise name, and a bad header never turns auth into a 500.
+
+    A target whose organization is suspended is not such a case: its identity
+    is returned with ``organization_suspended`` set, as a key lookup's row
+    carries it, and :func:`verify_api_key` refuses the request.
 
     The returned dict is shaped like the ``get_auth_context_by_key_hash`` row
     that :func:`verify_api_key` consumes downstream: ``user_id``, ``user_name``,
@@ -1324,6 +1392,18 @@ async def verify_api_key(
                 contact_email=_quota_contact(),
             )
             raise HTTPException(status_code=429, detail=body, headers=headers) from exc
+        except AgentOrganizationSuspended as exc:
+            # The refusal a key of the same account gets.
+            _refuse_suspended_organization(
+                request,
+                {
+                    **exc.organization,
+                    "organization_suspended": True,
+                    "user_id": exc.user_id,
+                    "role": exc.role,
+                },
+            )
+            raise  # not reached: the line above raises
         except AgentModelAuthError as exc:
             raise HTTPException(
                 status_code=exc.status_code,
@@ -1350,6 +1430,11 @@ async def verify_api_key(
     # keys off this identity, so log attribution and per-user concurrency follow.
     identity = await _resolve_effective_identity(caller, key_hash, x_on_behalf_of, op_store)
     effective_user_id = identity["user_id"]
+    if identity is not caller:
+        # The account the request is charged to is refused like its own key
+        # would be. It is not served as the service account instead: that
+        # would spend for a member of a suspended organization.
+        _refuse_suspended_organization(request, identity)
 
     # Pre-check daily cost quota via operational store counter table. On the
     # common path (no X-On-Behalf-Of) the spend arrived with the auth lookup in
@@ -1432,6 +1517,9 @@ async def authenticate_stored_key(
 
     Raises:
         StoredKeyRejected: The key no longer authenticates its owner.
+        StoredKeyOrganizationSuspended: The owner's organization is suspended.
+            The key works again after a restore, so the work must wait and
+            not fail.
         StoredKeyQuotaExceeded: The key has spent its budget, or the owner's
             account its daily or monthly cost quota.
         Exception: Whatever the store raised, unchanged: the answer is unknown,
@@ -1455,6 +1543,9 @@ async def authenticate_stored_key(
         raise StoredKeyRejected(
             "the API key was revoked or has expired, or the account is inactive"
         )
+    organization = organizations.suspended_in(user)
+    if organization is not None:
+        raise StoredKeyOrganizationSuspended(organization)
     if await _verification_pending(user):
         raise StoredKeyRejected("the account's email or phone is not verified")
 
@@ -1710,7 +1801,8 @@ async def optional_verify_api_key(
     Returns a minimal user context (with ``is_admin``) when a valid API key is
     present, or ``None`` when the key is missing/invalid.  Designed for
     read-only endpoints like ``/v1/models`` that need admin visibility without
-    side-effects.
+    side-effects. A valid key of an account whose organization is suspended is
+    refused with the 403 of :func:`_refuse_suspended_organization`.
     """
     # Auth disabled — treat caller as anonymous admin
     if not is_user_auth_enabled():
@@ -1749,6 +1841,10 @@ async def optional_verify_api_key(
 
     if not row:
         return None  # Key invalid or expired — treat as anonymous
+
+    # A live key of a member of a suspended organization is not anonymous: it
+    # is refused, here as on every other route that takes a key.
+    _refuse_suspended_organization(request, row)
 
     require_verification = get_settings().signup_require_email_verification
     try:

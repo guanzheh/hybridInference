@@ -27,11 +27,14 @@ from serving.config.settings import is_admin_email
 from serving.schemas_auth import SsoIdentity, SsoProviderRef
 from serving.setup_state import refresh_setup_state
 from serving.storage import sso as sso_store
+from serving.storage.base import OrganizationSuspendedError
 from serving.utils.email_blocklist import is_email_domain_blocked
 from serving.utils.jwt import generate_ulid
 from serving.utils.logging import get_logger
 
 if TYPE_CHECKING:
+    from collections.abc import Collection
+
     from serving.auth.oidc import ExternalIdentity
     from serving.config.sso import SsoProvider
 
@@ -45,6 +48,7 @@ RefusalCode = Literal[
     "no_account",
     "pending",
     "suspended",
+    "organization_suspended",
     "inactive",
     "unavailable",
     "failed",
@@ -68,6 +72,26 @@ class Resolution:
     created: dict[str, Any] | None = None
     #: The organization this sign-in made the account a member of, if it did.
     joined_organization: str | None = None
+
+
+def page_code(refusal: RefusalCode) -> str:
+    """The code the sign-in page is told for *refusal*.
+
+    A member of a suspended organization is told what a suspended account is
+    told. The page has a message for that, and a code of its own would be a
+    change of what the page must know. The login event keeps the two apart.
+    """
+    return "suspended" if refusal == "organization_suspended" else refusal
+
+
+async def organization_refusal(op_store: Any, user: dict[str, Any]) -> RefusalCode | None:
+    """The refusal for an account whose organization is suspended; None when none is.
+
+    Read without the cache: a sign-in starts a session, and it must not start
+    one on an answer up to a minute old.
+    """
+    suspended = await organizations.suspended_organization_of(op_store, user["id"], fresh=True)
+    return "organization_suspended" if suspended is not None else None
 
 
 def status_refusal(status: str | None) -> RefusalCode | None:
@@ -159,6 +183,36 @@ def confirms_through_provider(user: dict[str, Any]) -> bool:
     return not user.get("password_hash") and not (user.get("phone") and user.get("phone_verified"))
 
 
+async def loses_sign_in(op_store: Any, user: dict[str, Any], switched_off: Collection[str]) -> bool:
+    """Whether switching ``SSO_PROVIDERS`` entries off leaves an account no way to sign in.
+
+    True when an identity of the account signs in through one of the entries
+    *switched_off*, and the account has no password, no verified phone, and no
+    identity that an entry which stays on serves. "Serves" is
+    :func:`serving.config.sso.provider_for_identity`: an identity follows an
+    entry whose id changed, so the ids alone do not say.
+
+    Stricter than the disconnect of an identity
+    (``unlink_user_identity``), which counts any other identity, also one
+    whose entry is switched off already: here that would let the account
+    pass and then lose its sign-in.
+    """
+    if not switched_off or not confirms_through_provider(user):
+        return False
+    touched = stays = False
+    for row in await op_store.list_user_identities(user["id"]):
+        provider = sso_config.provider_for_identity(
+            row["provider_id"], row["issuer"], row.get("email")
+        )
+        if provider is None:
+            continue  # it signs in through no entry today
+        if provider.id in switched_off:
+            touched = True
+        else:
+            stays = True
+    return touched and not stays
+
+
 async def account_provider(op_store: Any, user_id: str) -> SsoProvider | None:
     """The offered provider an account most recently signed in through, if any."""
     try:
@@ -208,7 +262,7 @@ async def _resolve(
         user = await op_store.get_user_by_id(linked["user_id"])
         if user is None:
             return Resolution(refused="failed")
-        refusal = status_refusal(user.get("status"))
+        refusal = status_refusal(user.get("status")) or await organization_refusal(op_store, user)
         if refusal is not None:
             return Resolution(refused=refusal)
         return Resolution(user=user, identity_id=linked["id"])
@@ -219,7 +273,7 @@ async def _resolve(
 
     user = await op_store.get_user_by_email(email)
     if user is not None:
-        refusal = status_refusal(user.get("status"))
+        refusal = status_refusal(user.get("status")) or await organization_refusal(op_store, user)
         if refusal is not None:
             # Also an account that was deleted: its email stays taken, as it
             # does for signup.
@@ -273,17 +327,21 @@ async def _resolve(
 
     user_id, identity_id = generate_ulid(), generate_ulid()
     status = "pending_approval" if provider.require_approval else "active"
-    created = await op_store.create_sso_user(
-        user_id=user_id,
-        email=email,
-        user_name=identity.name,
-        role=provider.default_role,
-        status=status,
-        identity_id=identity_id,
-        provider_id=provider.id,
-        issuer=identity.issuer,
-        subject=identity.subject,
-    )
+    try:
+        created = await op_store.create_sso_user(
+            user_id=user_id,
+            email=email,
+            user_name=identity.name,
+            role=provider.default_role,
+            status=status,
+            identity_id=identity_id,
+            provider_id=provider.id,
+            issuer=identity.issuer,
+            subject=identity.subject,
+        )
+    except OrganizationSuspendedError:
+        # The provider belongs to a suspended organization: no account is made.
+        return Resolution(refused="organization_suspended")
     if not created:
         return None
     user = await op_store.get_user_by_id(user_id)

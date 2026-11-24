@@ -17,11 +17,17 @@ from typing import TYPE_CHECKING, Any, Literal
 from serving import quota
 from serving.accounting import AccountingPolicy, get_accounting_policy, money_decimal
 from serving.audit import AuditTarget, audit_columns
-from serving.config.settings import ROLE_RANK, VALID_ROLES, get_settings
+from serving.config.settings import (
+    ROLE_RANK,
+    VALID_ROLES,
+    admin_email_addresses,
+    get_settings,
+)
 from serving.exceptions import (
     AmbiguousAPIKeyError,
     APIKeyLimitReachedError,
     HardDeleteStateChanged,
+    KeyOwnerSuspendedError,
     PreferencesTooLargeError,
     ProjectNotFoundError,
     SelfDeleteRefused,
@@ -46,6 +52,7 @@ from serving.storage.organizations import (
     PostgresOrganizationsMixin,
     member_quota_join,
     signs_in_through_sso_only,
+    suspended_for,
 )
 from serving.storage.phone_auth import PostgresPhoneAuthMixin
 from serving.storage.pools import SingleConnectionPool, request_connection
@@ -54,7 +61,7 @@ from serving.storage.two_factor import PostgresTwoFactorMixin
 from serving.utils.logging import get_logger
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
     from contextlib import AbstractAsyncContextManager
     from datetime import datetime
 
@@ -529,16 +536,46 @@ _ACCOUNT_QUOTA_JOIN = (
 #: an identity that came without (``serving.organizations.check_fields``). An
 #: organization's counter is always written with its native amount, so it
 #: needs no rate.
-_ORGANIZATION_SCOPE_COLUMNS = (
-    "o.id AS organization_id, o.name AS organization_name, "
-    "o.monthly_limit_usd AS organization_limit_usd, "
-    "o.monthly_limit_amount AS organization_limit_amount"
-)
-_ORGANIZATION_COLUMNS = (
-    f"{_ORGANIZATION_SCOPE_COLUMNS}, "
-    "COALESCE(oc.cost_usd, 0) AS organization_spent_month_usd, "
-    "COALESCE(oc.cost_amount, 0) AS organization_spent_month_amount"
-)
+#:
+#: ``organization_suspended`` is whether its suspension refuses this account
+#: (:func:`serving.storage.organizations.suspended_for`). Every lookup carries
+#: it, and the place that authenticates the account reads it
+#: (``serving.organizations.suspended_in``): a lookup that left it out
+#: would let a member of a suspended organization pass. A lookup that reads no
+#: limit carries the status alone, with the name a refusal gives
+#: (:func:`_organization_status_columns`).
+#:
+#: Each of the three takes *exempt*, the SQL of the statement's parameter for
+#: :func:`serving.config.settings.admin_email_addresses`: a suspension does not
+#: reach a platform administrator, and an address listed there is one.
+
+
+def _organization_status_columns(exempt: str) -> str:
+    """The organization of the account, and whether its suspension refuses the account."""
+    return (
+        "o.id AS organization_id, o.name AS organization_name, "
+        f"COALESCE({suspended_for('o', 'ou', exempt)}, FALSE) AS organization_suspended"
+    )
+
+
+def _organization_scope_columns(exempt: str) -> str:
+    """:func:`_organization_status_columns` with the organization's monthly limit."""
+    return (
+        f"{_organization_status_columns(exempt)}, "
+        "o.monthly_limit_usd AS organization_limit_usd, "
+        "o.monthly_limit_amount AS organization_limit_amount"
+    )
+
+
+def _organization_columns(exempt: str) -> str:
+    """:func:`_organization_scope_columns` with what the organization spent this month."""
+    return (
+        f"{_organization_scope_columns(exempt)}, "
+        "COALESCE(oc.cost_usd, 0) AS organization_spent_month_usd, "
+        "COALESCE(oc.cost_amount, 0) AS organization_spent_month_amount"
+    )
+
+
 _ORGANIZATION_SPEND_JOIN = (
     "LEFT JOIN spend_counters oc "
     "  ON oc.scope_id = 'o:' || o.id "
@@ -673,6 +710,21 @@ async def _lock_all_account_keys(conn: asyncpg.Connection) -> None:
     table.
     """
     await conn.execute(f"SELECT pg_advisory_xact_lock({_ALL_ACCOUNT_KEYS_LOCK})")
+
+
+def _suspension_columns(fields: Mapping[str, Any]) -> dict[str, Any]:
+    """The ``users`` columns a suspension writes, each with its value.
+
+    *fields* are the caller's (the message the account is shown); the status
+    is added to them. An unknown field raises ``ValueError``.
+    """
+    from .base import USERS_MUTABLE_COLUMNS
+
+    fields = {**fields, "status": "suspended"}
+    invalid = set(fields) - USERS_MUTABLE_COLUMNS.keys()
+    if invalid:
+        raise ValueError(f"Invalid column(s) for users: {invalid}")
+    return {USERS_MUTABLE_COLUMNS[key]: value for key, value in fields.items()}
 
 
 async def _sync_account_quota(
@@ -906,6 +958,7 @@ REQUEST_PATH_READS = (
     "get_user_cost_period",
     "get_organization_month_spend",
     "get_organization_spend_scope",
+    "get_suspended_organization",
 )
 
 
@@ -1220,25 +1273,40 @@ class PostgresOperationalStore(
         """Take the lock every write to *user_id*'s keys takes first."""
         await _lock_account_keys(conn, user_id)
 
+    async def _lock_all_accounts_on(self, conn: asyncpg.Connection) -> None:
+        """Take the lock a write to the keys of many accounts takes first."""
+        await _lock_all_account_keys(conn)
+
     async def _suspend_user_on(self, conn: asyncpg.Connection, user_id: str, **fields: Any) -> None:
         """Suspend *user_id* and revoke its keys and sessions, in the caller's transaction."""
-        from .base import USERS_MUTABLE_COLUMNS
-
-        fields = {**fields, "status": "suspended"}
-        invalid = set(fields) - USERS_MUTABLE_COLUMNS.keys()
-        if invalid:
-            raise ValueError(f"Invalid column(s) for users: {invalid}")
-        set_parts = []
-        params: list[Any] = [user_id]
-        for idx, (key, val) in enumerate(fields.items(), start=2):
-            set_parts.append(f"{USERS_MUTABLE_COLUMNS[key]} = ${idx}")
-            params.append(val)
+        _suspension_columns(fields)  # an unknown column is refused before the lock is taken
         await _lock_account_keys(conn, user_id)
-        await conn.execute(f"UPDATE users SET {', '.join(set_parts)} WHERE id = $1", *params)
-        await conn.execute("UPDATE api_keys SET status = 'revoked' WHERE user_id = $1", user_id)
+        await self._suspend_accounts_on(conn, [user_id], **fields)
+
+    async def _suspend_accounts_on(
+        self, conn: asyncpg.Connection, user_ids: Sequence[str], **fields: Any
+    ) -> None:
+        """Suspend accounts and revoke their keys and sessions, in the caller's transaction.
+
+        Three statements however many accounts. The caller holds the key lock:
+        of each account (:func:`_lock_account_keys`), or of all
+        (:func:`_lock_all_account_keys`) for a write that spans accounts.
+        """
+        columns = _suspension_columns(fields)
+        ids = list(user_ids)
+        set_parts = [f"{column} = ${idx}" for idx, column in enumerate(columns, start=2)]
         await conn.execute(
-            "UPDATE auth_sessions SET revoked = TRUE WHERE user_id = $1 AND revoked IS NOT TRUE",
-            user_id,
+            f"UPDATE users SET {', '.join(set_parts)} WHERE id = ANY($1::text[])",
+            ids,
+            *columns.values(),
+        )
+        await conn.execute(
+            "UPDATE api_keys SET status = 'revoked' WHERE user_id = ANY($1::text[])", ids
+        )
+        await conn.execute(
+            "UPDATE auth_sessions SET revoked = TRUE "
+            "WHERE user_id = ANY($1::text[]) AND revoked IS NOT TRUE",
+            ids,
         )
 
     async def update_user_last_login(self, user_id: str) -> None:
@@ -1844,7 +1912,7 @@ class PostgresOperationalStore(
                 f"  k.key_prefix, k.status AS key_status, "
                 # The organization the account is a member of, if it is one.
                 f"  om.organization_id, o.name AS organization_name, "
-                f"  om.role AS organization_role "
+                f"  o.status AS organization_status, om.role AS organization_role "
                 f"  FROM users u "
                 f"  LEFT JOIN org_memberships om ON om.user_id = u.id "
                 f"  LEFT JOIN orgs o ON o.id = om.organization_id "
@@ -2109,7 +2177,7 @@ class PostgresOperationalStore(
             row = await conn.fetchrow(
                 "SELECT k.id, k.user_id, k.user_name, "
                 f"{_PROJECT_SCOPE_COLUMNS}, {_PROJECT_SCOPE_NATIVE_COLUMNS}, {_AUTH_KEY_COLUMNS}, "
-                f"{_KEY_NATIVE_COLUMNS}, {_ORGANIZATION_SCOPE_COLUMNS}, "
+                f"{_KEY_NATIVE_COLUMNS}, {_organization_scope_columns('$2')}, "
                 f"{identity}, u.role, u.email_verified, {_KEY_AUTH_PREFERENCES}, u.max_concurrent_requests "
                 "FROM api_keys k "
                 "LEFT JOIN users u ON u.id = k.user_id "
@@ -2120,6 +2188,7 @@ class PostgresOperationalStore(
                 "  AND u.id IS NOT NULL AND u.status = 'active' "
                 "AND (k.project_id IS NULL OR p.id IS NOT NULL)",
                 key_hash,
+                admin_email_addresses(),
             )
         return _coerce_user_row(row)
 
@@ -2150,7 +2219,7 @@ class PostgresOperationalStore(
                 f"{_PROJECT_SCOPE_NATIVE_COLUMNS}, {_SCOPE_SPEND_NATIVE_COLUMNS}, "
                 f"{_KEY_NATIVE_COLUMNS}, am.account_spent_month_amount, "
                 "ks.key_spent_today_amount, ks.key_spent_month_amount, "
-                f"{_ORGANIZATION_COLUMNS}, "
+                f"{_organization_columns('$3')}, "
                 f"{identity}, u.role, u.email_verified, {_KEY_AUTH_PREFERENCES}, u.max_concurrent_requests, "
                 "COALESCE(s.cost_usd, 0) AS cost_usd, "
                 "COALESCE(s.cost_amount, s.cost_usd * $2::numeric, 0) AS cost_amount "
@@ -2171,20 +2240,23 @@ class PostgresOperationalStore(
                 "AND (k.project_id IS NULL OR p.id IS NOT NULL)",
                 key_hash,
                 get_accounting_policy().usd_to_currency_rate,
+                admin_email_addresses(),
             )
         return _coerce_user_row(row)
 
     async def get_auth_context_lightweight(self, key_hash: str) -> Row | None:
         """Lightweight identity lookup (no quota check, no last_used write).
 
-        Carries the key's model allowlist, which the model listings apply.
+        Carries the key's model allowlist, which the model listings apply, and
+        whether the account's organization is suspended for it: the join for
+        the project's scope reads the organization already.
         """
         identity = _JOINED_USER_IDENTITY
         async with self._request_connection() as conn:
             row = await conn.fetchrow(
                 f"SELECT k.user_id, {identity}, u.role, u.email_verified, {_KEY_AUTH_PREFERENCES}, "
                 "u.max_concurrent_requests, k.allowed_models, "
-                "p.allowed_models AS project_allowed_models "
+                f"p.allowed_models AS project_allowed_models, {_organization_status_columns('$2')} "
                 "FROM api_keys k "
                 "LEFT JOIN users u ON u.id = k.user_id "
                 f"{_PROJECT_SCOPE_JOIN}"
@@ -2194,6 +2266,7 @@ class PostgresOperationalStore(
                 "  AND u.id IS NOT NULL AND u.status = 'active' "
                 "AND (k.project_id IS NULL OR p.id IS NOT NULL)",
                 key_hash,
+                admin_email_addresses(),
             )
         return _coerce_user_row(row)
 
@@ -2221,11 +2294,15 @@ class PostgresOperationalStore(
                 "k.status AS key_status, "
                 "(k.expires_at IS NOT NULL AND k.expires_at <= NOW()) AS key_expired, "
                 "EXTRACT(EPOCH FROM (k.expires_at - NOW()))::float8 AS expires_in_sec, "
-                "u.status AS user_status "
+                "u.status AS user_status, "
+                f"COALESCE({suspended_for('o', 'u', '$2')}, FALSE) AS organization_suspended "
                 "FROM api_keys k "
                 "LEFT JOIN users u ON u.id = k.user_id "
+                "LEFT JOIN org_memberships om ON om.user_id = k.user_id "
+                "LEFT JOIN orgs o ON o.id = om.organization_id "
                 "WHERE k.key_hash = $1",
                 key_hash,
+                admin_email_addresses(),
             )
         return dict(row) if row is not None else None
 
@@ -2312,6 +2389,8 @@ class PostgresOperationalStore(
 
         Raises:
             APIKeyLimitReachedError: The account already holds ``max_active_keys``.
+            KeyOwnerSuspendedError: The account is suspended. A suspension
+                revokes every key, so none is made after it.
         """
         # Default account_id to user_id so self-service AND admin-created keys
         # are visible/manageable in the dashboard (list/info/lookup all key off
@@ -2332,6 +2411,16 @@ class PostgresOperationalStore(
 
         async with self._pool.acquire() as conn, conn.transaction():
             await _lock_account_keys(conn, user_id)
+            # A suspension revokes every key of the account under this lock. A
+            # create that waited for it (a delete of the account's organization
+            # holds the lock of all accounts) would insert a live key after
+            # that, on a suspended account. An id with no account row, which an
+            # administrator may mint a key for, is not refused.
+            if (
+                await conn.fetchval("SELECT status FROM users WHERE id = $1", user_id)
+                == "suspended"
+            ):
+                raise KeyOwnerSuspendedError
             if max_active_keys is not None:
                 active = await conn.fetchval(
                     "SELECT COUNT(*) FROM api_keys WHERE user_id = $1 AND status = 'active'",
@@ -3621,7 +3710,7 @@ class PostgresOperationalStore(
                 f"{_ACCOUNT_QUOTA_COLUMNS}, u.role, "
                 # The native amounts beside them (``$2``: the fixed policy rate).
                 f"{_PROJECT_SCOPE_NATIVE_COLUMNS}, {_SCOPE_SPEND_NATIVE_COLUMNS}, "
-                f"{_ORGANIZATION_COLUMNS}, "
+                f"{_organization_columns('$3')}, "
                 "k.accounting_currency "
                 "FROM api_keys k "
                 "LEFT JOIN users u ON u.id = k.user_id "
@@ -3638,6 +3727,7 @@ class PostgresOperationalStore(
                 "LIMIT 1",
                 user_id,
                 get_accounting_policy().usd_to_currency_rate,
+                admin_email_addresses(),
             )
         return [_coerce_user_row(row) for row in rows]
 

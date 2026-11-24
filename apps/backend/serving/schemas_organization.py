@@ -24,6 +24,7 @@ MEMBER_LIMIT_MAX_USD = Decimal("999999.9999")
 
 Period = Literal["1d", "7d", "30d"]
 MemberRole = Literal["member", "admin"]
+OrganizationStatus = Literal["active", "suspended"]
 
 
 def _without_outer_spaces(value: Any) -> Any:
@@ -37,6 +38,16 @@ class OrganizationRef(BaseModel):
     id: str
     name: str
     role: MemberRole
+
+
+class AccountOrganization(OrganizationRef):
+    """The organization of an account, as the platform administrator is shown it.
+
+    With the status of the organization: an account of a suspended organization
+    is active itself, and the gateway refuses it.
+    """
+
+    status: OrganizationStatus = "active"
 
 
 class OrganizationConnection(BaseModel):
@@ -70,6 +81,8 @@ class OrganizationResponse(MoneyResponse):
 
     id: str
     name: str
+    #: ``suspended`` while the gateway refuses the members of the organization.
+    status: OrganizationStatus = "active"
     created_at: datetime
     member_count: int
     #: NULL is no limit.
@@ -86,10 +99,67 @@ class OrganizationResponse(MoneyResponse):
     administrators: list[OrganizationAdministrator] = Field(default_factory=list)
 
 
-class ListOrganizationsResponse(BaseModel):
-    """Every organization of the deployment."""
+class OrganizationListItem(OrganizationResponse):
+    """One organization in the list of the platform administrator.
 
-    organizations: list[OrganizationResponse]
+    The usage is that of the period the list was asked for, and null in a list
+    that was asked for no period.
+    """
+
+    #: The email domains of its SSO connections.
+    domains: list[str] = Field(default_factory=list)
+    #: The logged requests of its members in the period, free and failed ones too.
+    requests: int | None = None
+    #: What its members spent in the period.
+    cost_usd: float | None = None
+    cost: Decimal | None = None
+    #: Its part of what all organizations spent in the period, from 0 to 1.
+    spend_share: float | None = None
+
+
+class OrganizationTotals(MoneyResponse):
+    """The figures over all organizations, whatever the list is narrowed to.
+
+    The requests and the spend are those of the period, and null in a list
+    that was asked for no period.
+    """
+
+    organizations: int = 0
+    members: int = 0
+    requests: int | None = None
+    cost_usd: float | None = None
+    cost: Decimal | None = None
+
+
+class OrganizationStatusCounts(BaseModel):
+    """How many organizations have each status, whatever the list is narrowed to."""
+
+    active: int = 0
+    suspended: int = 0
+
+
+class AvailableConnection(BaseModel):
+    """An ``SSO_PROVIDERS`` entry that belongs to no organization, and can be attached to one."""
+
+    provider_id: str
+    display_name: str | None = None
+    domains: list[str] = Field(default_factory=list)
+    enabled: bool = False
+
+
+class ListOrganizationsResponse(BaseModel):
+    """The organizations of the deployment, with the usage of a period when one was asked for.
+
+    ``total`` is the number of organizations after ``status`` and ``search``.
+    ``totals`` and ``status_counts`` are over all organizations.
+    """
+
+    organizations: list[OrganizationListItem]
+    total: int = 0
+    period: Period | None = None
+    totals: OrganizationTotals = Field(default_factory=OrganizationTotals)
+    status_counts: OrganizationStatusCounts = Field(default_factory=OrganizationStatusCounts)
+    available_connections: list[AvailableConnection] = Field(default_factory=list)
 
 
 class CreateOrganizationRequest(MoneyInput):
@@ -165,6 +235,37 @@ class SetMonthlyLimitRequest(MoneyInput):
         default=None, ge=0, le=MEMBER_LIMIT_MAX_USD, decimal_places=4
     )
     monthly_limit: Decimal | None = Field(default=None, ge=0, exclude=True)
+
+
+class DeleteOrganizationRequest(BaseModel):
+    """Delete an organization. This cannot be undone."""
+
+    confirm_name: str = Field(
+        ...,
+        max_length=200,
+        description="The name of the organization, exactly: a wrong id must not delete one",
+    )
+    password: str | None = Field(
+        None,
+        description="The signed-in administrator's password, for an account that confirms with it",
+    )
+    disable_connections: bool = Field(
+        True,
+        description=(
+            "Switch off the SSO_PROVIDERS entries of the organization, so that a first "
+            "sign-in through one makes no personal account"
+        ),
+    )
+
+
+class OrganizationDeletedResponse(BaseModel):
+    """What a delete did."""
+
+    message: str
+    #: The member accounts that were active and are now suspended.
+    accounts_suspended: int
+    #: The ``SSO_PROVIDERS`` entries this delete switched off.
+    connections_disabled: list[str] = Field(default_factory=list)
 
 
 class OrganizationMessageResponse(BaseModel):
@@ -252,7 +353,8 @@ class OrganizationAuditEntry(BaseModel):
 
     ``actor`` is ``platform_administrator`` for a platform administrator,
     whose account an organization is not shown; ``member`` otherwise, with the
-    account in ``actor_user_id`` and ``actor_email``.
+    account in ``actor_user_id`` and ``actor_email``. A platform administrator
+    who reads the log is shown the account of a platform administrator too.
     """
 
     id: int

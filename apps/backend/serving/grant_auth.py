@@ -41,7 +41,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
-from serving import grants, quota
+from serving import grants, organizations, quota
 from serving.accounting import get_accounting_policy, money_decimal
 from serving.model_access import PROJECT_ALLOWED_MODELS_KEY, disabled_models_of
 from serving.spend_ledger import SPEND_CHECK_KEY, SpendCheck, ledger_for
@@ -96,6 +96,25 @@ class AgentQuotaExceeded(AgentModelAuthError):
         # The refusal itself, so the HTTP layer answers with its exact native
         # amounts on a non-USD ledger rather than re-deriving them from USD.
         self.refusal = refusal or quota.BudgetRefusal("account", window, quota_usd, spent_usd)
+
+
+class AgentOrganizationSuspended(AgentModelAuthError):
+    """The grant's owner is a member of a suspended organization.
+
+    ``organization`` is the organization, as
+    :func:`serving.organizations.suspended_in` gives it, and ``user_id`` and
+    ``role`` are the owner's. The route answers with the refusal a request
+    with an API key of the same account gets, and records it for that account.
+    """
+
+    def __init__(
+        self, organization: Mapping[str, Any], *, user_id: str, role: str | None = None
+    ) -> None:
+        """Record the organization that refuses the account, and the account."""
+        super().__init__(organizations.suspended_message(organization), status_code=403)
+        self.organization = dict(organization)
+        self.user_id = user_id
+        self.role = role
 
 
 async def _resolve_grant(
@@ -309,13 +328,23 @@ async def authenticate_grant_model_call(
     authenticated and never metered; that bypass closes here.
 
     Raises:
-        AgentModelAuthError: For an unusable grant or an exhausted quota.
+        AgentModelAuthError: For an unusable grant or an exhausted quota, and
+            (:class:`AgentOrganizationSuspended`) for an owner whose
+            organization is suspended.
     """
     row = await _resolve_grant(api_key, op_store=op_store)
 
     user = await _active_subject(op_store, row["user_id"])
     scope: dict[str, Any] = {}
     check = await _quota_check(op_store, row["user_id"], scope)
+    # The grant lookup reads no organization. The quota context of the account
+    # does, uncached, so a suspension refuses the next call of a grant that
+    # was minted before it.
+    organization = organizations.suspended_in(scope)
+    if organization is not None:
+        raise AgentOrganizationSuspended(
+            organization, user_id=row["user_id"], role=user.get("role")
+        )
     refusal = check.refusal() if check is not None else None
     if refusal is not None:
         raise AgentQuotaExceeded(

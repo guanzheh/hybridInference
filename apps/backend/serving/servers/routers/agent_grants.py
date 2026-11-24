@@ -28,7 +28,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Query, status
 from pydantic import BaseModel, Field
 
-from serving import grants
+from serving import grants, organizations
 from serving.model_access import disabled_models_of
 from serving.model_catalog import agent_visible_models
 from serving.servers.deps import (
@@ -58,9 +58,6 @@ router = APIRouter(
     tags=["internal"],
     dependencies=[Depends(require_dispatch_token)],
 )
-
-#: A status outside "active" is refused rather than defaulted.
-_ACTIVE_STATUS = "active"
 
 #: A renewal buys the same bounded step a mint does.
 MAX_RENEW_TTL_S = grants.DEFAULT_GRANT_TTL_S
@@ -102,10 +99,11 @@ async def _active_user(store: Any, user_id: str) -> dict[str, Any]:
     """Load the grant's subject, refusing anyone who may not use the platform.
 
     Raises:
-        HTTPException: 403 for unknown or non-active accounts.
+        HTTPException: 403 for unknown or non-active accounts, and for a
+            member of a suspended organization.
     """
     user = await store.get_user_by_id(user_id)
-    if user is None or user.get("status") != _ACTIVE_STATUS:
+    if not await organizations.account_available(store, user):
         # One message for both cases: whether a given user id exists is not
         # something an internal caller needs, and saying so enumerates accounts.
         raise _error(

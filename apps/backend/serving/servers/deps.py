@@ -15,9 +15,11 @@ from typing import TYPE_CHECKING, Any
 import jwt
 from fastapi import Depends, Header, HTTPException, Request
 
+from serving import organizations
 from serving.audit import AuditActor
 from serving.auth.two_factor import admin_two_factor_required, require_session_two_factor
 from serving.config.settings import get_settings
+from serving.config.site_identity import get_site_identity
 from serving.utils.logging import get_logger
 from serving.utils.phone_auth import phone_identity_unverified
 from serving.utils.request_ip import get_client_ip
@@ -61,6 +63,8 @@ def auth_database_detail() -> str:
 
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from routing.manager import RoutingManager
     from routing.model_router_registry import ModelRouterRegistry
     from routing.routers import FixedRouter, ManagedRouter
@@ -348,6 +352,39 @@ async def require_live_session(op_store: Any, payload: dict[str, Any]) -> None:
         )
 
 
+def refuse_suspended_organization(
+    organization: Mapping[str, Any] | None, *, plain: bool = False
+) -> None:
+    """Refuse an account that its suspended organization refuses; return for None.
+
+    Every place that authenticates an account calls this with what its lookup
+    said -- :func:`serving.organizations.suspended_in` for the row of a key
+    lookup, :func:`serving.organizations.suspended_organization_of` for an
+    account -- before it does anything for the account. One function, so that
+    every surface gives the same answer.
+
+    Args:
+        organization: The suspended organization, or None for an account no
+            suspension refuses.
+        plain: Give the detail as one sentence, the form of the answer for an
+            account that is not active, which the console reads. Otherwise the
+            body has the organization and a code in fields a client can read.
+
+    Raises:
+        HTTPException: 403 when *organization* is not None.
+    """
+    if organization is None:
+        return
+    if plain:
+        raise HTTPException(status_code=403, detail=organizations.suspended_message(organization))
+    raise HTTPException(
+        status_code=403,
+        detail=organizations.suspended_payload(
+            organization, contact_email=get_site_identity().support_email
+        ),
+    )
+
+
 async def get_current_user(
     authorization: str | None = Header(None),
     op_store=Depends(get_operational_store),
@@ -367,8 +404,30 @@ async def get_current_user(
 
     Raises:
         HTTPException: 401 if token is missing, invalid, or expired, or its
-            session has ended (see :func:`require_live_session`).
+            session has ended (see :func:`require_live_session`); 403 for an
+            account that is not active, or whose organization is suspended
+            (:func:`refuse_suspended_organization`).
     """
+    return await _session_account(authorization, op_store, check_organization=True)
+
+
+async def get_current_user_to_sign_out(
+    authorization: str | None = Header(None),
+    op_store=Depends(get_operational_store),
+) -> dict[str, Any]:
+    """The signed-in account, for the route that ends its session.
+
+    :func:`get_current_user` without the check of the organization. A suspend
+    of an organization ends no session, so a member is refused on every route
+    and must still be able to sign out.
+    """
+    return await _session_account(authorization, op_store, check_organization=False)
+
+
+async def _session_account(
+    authorization: str | None, op_store: Any, *, check_organization: bool
+) -> dict[str, Any]:
+    """Verify a console token and return the context of its account."""
     from serving.utils.jwt import verify_access_token
 
     if not authorization or not authorization.startswith("Bearer "):
@@ -423,6 +482,11 @@ async def get_current_user(
         raise HTTPException(
             status_code=403,
             detail=f"Account is {user_row['status']}. Please contact support.",
+        )
+
+    if check_organization:
+        refuse_suspended_organization(
+            await organizations.suspended_organization_of(op_store, user_id), plain=True
         )
 
     require_verification = get_settings().signup_require_email_verification
@@ -670,19 +734,28 @@ def user_audit_actor(request: Request, current_user: dict[str, Any]) -> AuditAct
 
 @dataclass(frozen=True, slots=True)
 class OrganizationAdmin:
-    """An organization administrator a route admitted, and where it acts.
+    """Who a route of the organization console admitted, and the organization it acts in.
+
+    An organization administrator, in the organization of its own membership
+    (:func:`require_organization_admin`). Or, with ``for_platform``, a platform
+    administrator in the organization that the path names: each route of the
+    console is also served below ``/admin/organizations/{organization_id}``
+    (:mod:`serving.servers.routers.admin.organization_pages`).
 
     Attributes:
-        organization_id: The organization of the caller's own membership.
+        organization_id: The organization the caller acts in.
         organization_name: Its name, for the messages an action writes.
-        user_id: The caller's account.
+        user_id: The caller's account. None for the admin token, which has none.
         actor: The caller, as its audit rows record it.
+        for_platform: The caller is a platform administrator, and no
+            administrator of the organization.
     """
 
     organization_id: str
     organization_name: str
-    user_id: str
+    user_id: str | None
     actor: AuditActor
+    for_platform: bool = False
 
 
 async def require_organization_admin(

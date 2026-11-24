@@ -25,6 +25,7 @@ from serving.auth import sso_accounts
 from serving.exceptions import (
     AmbiguousAPIKeyError,
     APIKeyLimitReachedError,
+    KeyOwnerSuspendedError,
     PreferencesTooLargeError,
     ProjectNotFoundError,
     UserNotFoundError,
@@ -624,6 +625,10 @@ async def create_api_key(
                 "deployment if you need more."
             ),
         ) from exc
+    except KeyOwnerSuspendedError as exc:
+        # The session was admitted, and the account was suspended before the
+        # key was written: a delete of its organization held the key lock.
+        raise HTTPException(status_code=409, detail=KeyOwnerSuspendedError.MESSAGE) from exc
 
     logger.info(f"API key created for user: {current_user['user_id']}")
     await log_admin_action(

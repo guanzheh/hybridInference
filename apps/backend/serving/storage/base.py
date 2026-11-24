@@ -172,6 +172,14 @@ API_KEYS_MUTABLE_COLUMNS: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 
+class OrganizationSuspendedError(RuntimeError):
+    """A sign-in would make an account a member of a suspended organization.
+
+    Raised by a store that was asked to create an account through a connection
+    of such an organization. Nothing was written.
+    """
+
+
 class OrganizationsUnavailableError(RuntimeError):
     """This store keeps no organizations.
 
@@ -318,8 +326,8 @@ class OperationalStore(ABC):
         """One organization with its member count and the ids of its SSO connections."""
         raise OrganizationsUnavailableError
 
-    async def list_organizations(self) -> list[Row]:
-        """Every organization, by name."""
+    async def list_organizations(self, **fields: Any) -> list[Row]:
+        """Every organization, by name, with the usage of a span of UTC days when one is given."""
         raise OrganizationsUnavailableError
 
     async def rename_organization(self, organization_id: str, name: str, **fields: Any) -> str:
@@ -330,6 +338,22 @@ class OperationalStore(ABC):
         self, organization_id: str, limit: str, **fields: Any
     ) -> tuple[str, Any, Any]:
         """Set or clear one of an organization's limits."""
+        raise OrganizationsUnavailableError
+
+    async def set_organization_status(
+        self, organization_id: str, status: str, **fields: Any
+    ) -> str:
+        """Suspend an organization, or restore it."""
+        raise OrganizationsUnavailableError
+
+    async def get_suspended_organization(self, user_id: str, *, fresh: bool = False) -> Row | None:
+        """The suspended organization that refuses an account; None when none does."""
+        raise OrganizationsUnavailableError
+
+    async def delete_organization(
+        self, organization_id: str, **fields: Any
+    ) -> tuple[str, dict[str, Any]]:
+        """Delete an organization and suspend the accounts of its members."""
         raise OrganizationsUnavailableError
 
     async def get_provider_organization(self, provider_id: str) -> str | None:
@@ -366,6 +390,10 @@ class OperationalStore(ABC):
         self, organization_id: str, user_id: str, key_id: int, **fields: Any
     ) -> tuple[str, str | None]:
         """Revoke one API key of a member."""
+        raise OrganizationsUnavailableError
+
+    async def list_organization_member_ids(self, organization_id: str) -> list[str]:
+        """The account of every member of an organization, in no order."""
         raise OrganizationsUnavailableError
 
     async def set_organization_member_role(
@@ -718,8 +746,8 @@ class OperationalStore(ABC):
           today/month spend meets the threshold (USD).
         - ``organization_id``: keep the members of one organization, or with
           ``"none"`` the accounts in no organization. Each row has
-          ``organization_id``, ``organization_name`` and ``organization_role``,
-          NULL for an account in none.
+          ``organization_id``, ``organization_name``, ``organization_status``
+          and ``organization_role``, NULL for an account in none.
         - ``quota_state``: ``"default"``/``"custom"`` filter on the user's
           active key quota; ``"near"``/``"over"`` compare today's spend
           against quota.
@@ -934,6 +962,8 @@ class OperationalStore(ABC):
 
         Raises:
             APIKeyLimitReachedError: The account already holds ``max_active_keys``.
+            KeyOwnerSuspendedError: The account is suspended. A suspension
+                revokes every key, so none is made after it.
         """
 
     @abstractmethod

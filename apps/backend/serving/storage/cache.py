@@ -24,7 +24,7 @@ from .cache_backend import (
     InMemoryCache as InMemoryCache,
     _snapshot,
 )
-from .organizations import UPDATED
+from .organizations import DELETED, UPDATED
 from .sso import LINKED
 
 if TYPE_CHECKING:
@@ -147,6 +147,13 @@ class CachedOperationalStore(OperationalStore):
         # Deliberately inside the ``auth_light:`` namespace -- see
         # get_key_owner_for_audit for why it shares the existing invalidation.
         return f"auth_light:audit:{key_hash}"
+
+    @staticmethod
+    def _suspended_organization_key(user_id: str) -> str:
+        # Inside the ``auth_light:`` namespace, like the audit identity: every
+        # eviction of all auth entries then clears this answer too. An account
+        # id is no key hash, and the prefix keeps the two apart.
+        return f"auth_light:organization-suspended:{user_id}"
 
     @staticmethod
     def _user_key(user_id: str) -> str:
@@ -1232,9 +1239,11 @@ class CachedOperationalStore(OperationalStore):
 
     # -- organizations -------------------------------------------------------
     #
-    # Nothing here is cached. A change that reaches what the auth lookups
-    # return (a member's status or role, a limit, the name) evicts the cached
-    # auth entries it concerns, as the account writes above do.
+    # One answer here is cached: whether an account's organization is
+    # suspended for it (get_suspended_organization). A change that reaches
+    # that answer or what the auth lookups return (a member's status or role,
+    # a limit, the name, the status of the organization) evicts the cached
+    # entries it concerns, as the account writes above do.
 
     async def create_organization(self, **fields: Any) -> tuple[str, int]:
         """Create an organization with its SSO connections and their members."""
@@ -1257,9 +1266,9 @@ class CachedOperationalStore(OperationalStore):
         """One organization with its member count and the ids of its SSO connections."""
         return await self._store.get_organization(organization_id)
 
-    async def list_organizations(self) -> list[Row]:
-        """Every organization, by name."""
-        return await self._store.list_organizations()
+    async def list_organizations(self, **fields: Any) -> list[Row]:
+        """Every organization, by name, with the usage of a span of UTC days when one is given."""
+        return await self._store.list_organizations(**fields)
 
     async def rename_organization(self, organization_id: str, name: str, **fields: Any) -> str:
         """Give an organization another name, then evict the cached auth entries."""
@@ -1278,6 +1287,68 @@ class CachedOperationalStore(OperationalStore):
         # A limit of the organization reaches every member; one eviction for
         # all of them costs each a lookup, which a change this rare can afford.
         await self.invalidate_auth_caches()
+        return result
+
+    async def set_organization_status(
+        self, organization_id: str, status: str, **fields: Any
+    ) -> str:
+        """Suspend or restore an organization, then evict the cached auth entries."""
+        outcome = await self._store.set_organization_status(organization_id, status, **fields)
+        if outcome == UPDATED:
+            # The lookup of each member's keys carries whether its organization
+            # is suspended, and so does the cached answer for its account.
+            await self.invalidate_auth_caches()
+        return outcome
+
+    async def get_suspended_organization(self, user_id: str, *, fresh: bool = False) -> Row | None:
+        """The suspended organization that refuses an account, cached for 60 s.
+
+        Asked on every request a session makes, so both answers are kept: an
+        account in no organization, the usual one, then costs no read either.
+        The entry is in the namespace of the auth lookups and carries the tag
+        of the account, so it goes with them: on a suspend, a restore or a
+        delete (:meth:`invalidate_auth_caches`), and on a change of the
+        account's role, a removal or an attach
+        (:meth:`invalidate_user_auth_caches`). *fresh* reads the store and
+        leaves the cache alone: a sign-in must not start a session on an
+        answer up to a minute old.
+        """
+        if fresh:
+            return await self._store.get_suspended_organization(user_id, fresh=fresh)
+        ck = self._suspended_organization_key(user_id)
+        cached = await self._cache.get(ck)
+        if cached is not None:
+            return _snapshot(cached) or None
+        gen_before = self._cache.current_generation()
+        result = await self._store.get_suspended_organization(user_id, fresh=fresh)
+        await self._cache.set_if_generation(
+            ck,
+            _snapshot(result) if result is not None else {},
+            _USER_TTL,
+            generation=gen_before,
+            tags=(self._user_auth_tag(user_id),),
+        )
+        return result
+
+    async def delete_organization(
+        self, organization_id: str, **fields: Any
+    ) -> tuple[str, dict[str, Any]]:
+        """Delete an organization, then invalidate what its members had cached.
+
+        The accounts the delete suspended, as a suspension does: their session
+        answers. And, for every account, the cached account row and the cached
+        auth entries: a member the delete did not suspend (a platform
+        administrator, an account suspended before) has lookups that carry the
+        organization, and an account row that carries the models the
+        organization turned off for it. The store names only the accounts it
+        suspended, so every row goes, as after an attach.
+        """
+        result = await self._store.delete_organization(organization_id, **fields)
+        if result[0] == DELETED:
+            for user_id in result[1].get("suspended_user_ids", ()):
+                await self._forget_sessions(user_id)
+            await self._cache.delete_pattern(self._user_key("*"))
+            await self.invalidate_auth_caches()
         return result
 
     async def get_provider_organization(self, provider_id: str) -> str | None:
@@ -1307,6 +1378,10 @@ class CachedOperationalStore(OperationalStore):
     async def get_organization_membership(self, user_id: str) -> Row | None:
         """The organization an account belongs to and its role there, if any."""
         return await self._store.get_organization_membership(user_id)
+
+    async def list_organization_member_ids(self, organization_id: str) -> list[str]:
+        """The account of every member of an organization, in no order."""
+        return await self._store.list_organization_member_ids(organization_id)
 
     async def set_organization_member_role(
         self, organization_id: str, user_id: str, role: str, **fields: Any

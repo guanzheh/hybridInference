@@ -174,7 +174,8 @@ async def signs_in_through_sso_only(op_store: Any, user: Mapping[str, Any]) -> b
 
 
 #: The columns an identity carries of the organization its requests are checked
-#: against (:func:`serving.quota.organization_fields` reads them).
+#: against (:func:`serving.quota.organization_fields` reads the limit and the
+#: spend, :func:`suspended_in` whether the organization is suspended for it).
 ORGANIZATION_COLUMNS = (
     "organization_id",
     "organization_name",
@@ -182,7 +183,87 @@ ORGANIZATION_COLUMNS = (
     "organization_limit_amount",
     "organization_spent_month_usd",
     "organization_spent_month_amount",
+    "organization_suspended",
 )
+
+#: The code of the refusal a member of a suspended organization gets, and the
+#: reason its rejection and its failed sign-in are recorded with.
+SUSPENDED_CODE = "organization_suspended"
+
+
+def suspended_in(identity: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """The suspended organization a lookup row names for its account, if any.
+
+    From the ``organization_suspended`` column of the key lookups and of the
+    quota context of an account: the store decides for whom a suspension
+    applies (:func:`serving.storage.organizations.suspended_for`), and a place
+    that authenticates an account only reads the answer. None for a row of an
+    account the suspension does not reach, and for a row of a lookup that
+    reads no organization.
+    """
+    if not identity or identity.get("organization_suspended") is not True:
+        return None
+    return {
+        "organization_id": identity.get("organization_id"),
+        "organization_name": identity.get("organization_name"),
+    }
+
+
+async def suspended_organization_of(
+    op_store: Any, user_id: str, *, fresh: bool = False
+) -> dict[str, Any] | None:
+    """The suspended organization that refuses an account, read by account.
+
+    For a caller with no lookup row that carries it: a session, a sign-in, an
+    internal lookup. The store keeps the answer for a minute; *fresh* asks the
+    database, for a sign-in, which must not start a session on an old answer.
+    None for an account no suspension refuses, and in a store that keeps no
+    organizations.
+    """
+    lookup = getattr(op_store, "get_suspended_organization", None)
+    if lookup is None:
+        return None
+    try:
+        answer = lookup(user_id, fresh=fresh)
+        if inspect.isawaitable(answer):
+            answer = await answer
+    except OrganizationsUnavailableError:
+        return None
+    return dict(answer) if isinstance(answer, Mapping) and answer else None
+
+
+async def account_available(op_store: Any, user: Mapping[str, Any] | None) -> bool:
+    """Whether an account may act now: it is active, and no suspended organization refuses it.
+
+    *user* is the row of the account, None for an unknown one. For the places
+    that read an account by its id and answer for it: an internal lookup, a
+    grant route, the exchange of an identity code. Each of them answers for a
+    member of a suspended organization as it does for a suspended account.
+    """
+    if user is None or user.get("status") != "active":
+        return False
+    return await suspended_organization_of(op_store, user["id"]) is None
+
+
+def suspended_message(organization: Mapping[str, Any]) -> str:
+    """What a member of a suspended organization is told, wherever it is refused."""
+    name = organization.get("organization_name") or ""
+    return f"Organization '{name}' is suspended. Contact an administrator of your organization."
+
+
+def suspended_payload(organization: Mapping[str, Any], *, contact_email: str) -> dict[str, Any]:
+    """The body of the 403 a request with a key of a suspended organization gets.
+
+    It names the organization: a refusal that looked like an invalid key would
+    send the member to make a new key, which is refused the same way.
+    """
+    return {
+        "error": "Organization suspended",
+        "code": SUSPENDED_CODE,
+        "organization": organization.get("organization_name") or "",
+        "contact_email": contact_email,
+        "message": suspended_message(organization),
+    }
 
 
 async def month_spend_of(op_store: Any, organization_id: str, *, native: bool) -> Any:
@@ -518,11 +599,12 @@ def request_view(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def audit_entry_view(row: dict[str, Any]) -> dict[str, Any]:
+def audit_entry_view(row: dict[str, Any], *, for_platform: bool = False) -> dict[str, Any]:
     """An audit row as an organization is shown it.
 
     A platform administrator is named as that and nothing more: its account is
-    the deployment's, not the organization's to see.
+    the deployment's, not the organization's to see. With *for_platform* the
+    reader is a platform administrator, who is shown that account.
     """
     action = row["action"]
     category = next(
@@ -544,6 +626,8 @@ def audit_entry_view(row: dict[str, Any]) -> dict[str, Any]:
     }
     if row.get("actor_type") in ("admin", "admin_token"):
         entry["actor"] = "platform_administrator"
+        if for_platform and row.get("actor_type") == "admin":
+            entry.update(actor_user_id=row.get("actor_id"), actor_email=row.get("actor_email"))
     elif row.get("actor_type") == "user":
         entry.update(
             actor="member", actor_user_id=row.get("actor_id"), actor_email=row.get("actor_email")
@@ -551,6 +635,127 @@ def audit_entry_view(row: dict[str, Any]) -> dict[str, Any]:
     else:
         entry["actor"] = "system"
     return entry
+
+
+#: What the list of organizations can be ordered by: the key of a row for each.
+ORGANIZATION_ORDER: dict[str, Any] = {
+    "name": lambda row: row["name"].casefold(),
+    "members": lambda row: row["member_count"],
+    "requests": lambda row: row["requests"],
+    "spend": lambda row: Decimal(str(row["cost_amount"] or 0)),
+    "month_spend": lambda row: Decimal(str(row["spent_month_amount"] or 0)),
+}
+#: The orders that need the usage of a period.
+ORDERS_OF_A_PERIOD = ("requests", "spend")
+
+
+def available_connections(taken: Iterable[str]) -> list[dict[str, Any]]:
+    """The ``SSO_PROVIDERS`` entries that belong to no organization, in the order of the document.
+
+    *taken* holds the provider ids that organizations have. An entry that is
+    switched off is listed too: a delete leaves the entries of its
+    organization off, and they can be attached again.
+    """
+    held = set(taken)
+    return [
+        {
+            "provider_id": provider.id,
+            "display_name": provider.display_name,
+            "domains": list(provider.domains),
+            "enabled": provider.enabled,
+        }
+        for provider in sso_config.get_sso_document().providers
+        if provider.id not in held
+    ]
+
+
+async def organizations_view(
+    op_store: Any,
+    period: str | None = None,
+    *,
+    status: str | None = None,
+    search: str | None = None,
+    sort_by: str = "name",
+    descending: bool = False,
+    limit: int | None = None,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """The organizations of the deployment, with the usage of *period* when one is given.
+
+    Without *period* a row has no usage and the store reads none: this is the
+    list as a caller reads it that wants the organizations and not their
+    figures, for a filter. Without *limit*, every row from *offset* on.
+
+    *status* keeps the organizations that have it; *search* those whose name,
+    or a domain of whose connections, contains the text; *sort_by* is a key of
+    :data:`ORGANIZATION_ORDER`. The totals and the count of each status are
+    over all organizations, so the figures above a table do not change when
+    the table is narrowed.
+
+    The domains of an organization are in ``SSO_PROVIDERS`` and in no table, so
+    the search, the order and the page are applied here to the rows the store
+    read. That read is a fixed number of statements
+    (:meth:`~serving.storage.organizations.PostgresOrganizationsMixin.list_organizations`).
+
+    Raises:
+        ValueError: An order that is no key of :data:`ORGANIZATION_ORDER`, or
+            one of :data:`ORDERS_OF_A_PERIOD` without a period.
+    """
+    if sort_by not in ORGANIZATION_ORDER:
+        raise ValueError(f"unknown organization order {sort_by!r}")
+    if period is None and sort_by in ORDERS_OF_A_PERIOD:
+        raise ValueError(f"the order {sort_by!r} needs a period")
+    span: dict[str, Any] = {}
+    if period is not None:
+        span["first_day"], span["last_day"] = period_span(period)
+    rows = await op_store.list_organizations(**span)
+    spent = sum((ORGANIZATION_ORDER["spend"](row) for row in rows), Decimal(0)) if span else None
+    for row in rows:
+        connections = [connection_view(provider_id) for provider_id in row["provider_ids"]]
+        domains = dict.fromkeys(
+            domain for connection in connections for domain in connection.get("domains", ())
+        )
+        row.update(connections=connections, domains=list(domains))
+        if spent is not None:
+            row["spend_share"] = float(ORGANIZATION_ORDER["spend"](row) / spent) if spent else 0.0
+    kept = rows
+    if status is not None:
+        kept = [row for row in kept if row["status"] == status]
+    if search and search.strip():
+        text = search.strip().casefold()
+        kept = [
+            row
+            for row in kept
+            if text in row["name"].casefold()
+            or any(text in domain.casefold() for domain in row["domains"])
+        ]
+    # By the name first: the sort keeps the order of rows with one figure,
+    # also from the largest to the smallest.
+    kept = sorted(kept, key=lambda row: (row["name"].casefold(), row["id"]))
+    kept = sorted(kept, key=ORGANIZATION_ORDER[sort_by], reverse=descending)
+    totals: dict[str, Any] = {
+        "organizations": len(rows),
+        "members": sum(row["member_count"] for row in rows),
+    }
+    if spent is not None:
+        totals.update(
+            requests=sum(row["requests"] for row in rows),
+            cost_usd=float(sum((Decimal(str(row["cost_usd"] or 0)) for row in rows), Decimal(0))),
+            cost_amount=spent,
+        )
+    return {
+        "organizations": kept[offset:] if limit is None else kept[offset : offset + limit],
+        "total": len(kept),
+        "period": period,
+        "totals": totals,
+        "status_counts": {
+            name: sum(1 for row in rows if row["status"] == name)
+            for name in ("active", "suspended")
+        },
+        "available_connections": available_connections(
+            provider_id for row in rows for provider_id in row["provider_ids"]
+        ),
+    }
 
 
 async def organization_view(op_store: Any, organization_id: str) -> dict[str, Any] | None:
@@ -881,10 +1086,13 @@ async def audit_view(
     member: str | None = None,
     limit: int = 50,
     offset: int = 0,
+    for_platform: bool = False,
 ) -> dict[str, Any]:
     """One page of the organization's audit log, newest first.
 
     *member* keeps the rows that have that account as target or as actor.
+    *for_platform* is for a platform administrator who reads it
+    (:func:`audit_entry_view`).
     """
     since = None
     if period is not None:
@@ -899,4 +1107,7 @@ async def audit_view(
         limit=limit,
         offset=offset,
     )
-    return {"total": total, "entries": [audit_entry_view(row) for row in rows]}
+    return {
+        "total": total,
+        "entries": [audit_entry_view(row, for_platform=for_platform) for row in rows],
+    }

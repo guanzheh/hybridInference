@@ -502,7 +502,7 @@ async def _finish_login(
             failure_reason=f"sso_{resolution.refused}",
             user_id=resolution.created["id"] if resolution.created else None,
         )
-        return _login_error(resolution.refused)
+        return _login_error(sso_accounts.page_code(resolution.refused))
 
     if resolution.pending_link:
         token = secrets.token_urlsafe(32)

@@ -17,11 +17,129 @@ import pytest
 from routing.routers import FixedRouter
 from serving.batch import validation
 from serving.batch.config import BatchConfig
+from serving.servers.auth import StoredKeyOrganizationSuspended
 from serving.storage.batch_file_store import BatchFileStore
 from serving.storage.batch_store import BatchStore
 from tests.fixtures import postgres
 
 pytestmark = [pytest.mark.dbtest, pytest.mark.asyncio]
+
+
+async def test_a_batch_whose_owners_organization_is_suspended_waits_and_is_not_failed(monkeypatch):
+    """A restore undoes a suspension: the input is judged then, with the same key."""
+    pool = await postgres.create_pool(min_size=1, max_size=6)
+    store, files = BatchStore(pool), BatchFileStore(pool)
+    owner = f"review-suspended-{uuid.uuid4().hex}"
+    try:
+        raw = (
+            json.dumps(
+                {
+                    "custom_id": "one",
+                    "method": "POST",
+                    "url": "/v1/chat/completions",
+                    "body": {
+                        "model": "review-model",
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                }
+            )
+            + "\n"
+        ).encode("ascii")
+        file_id = await files.create_upload(
+            user_id=owner,
+            filename="input.jsonl",
+            purpose="batch",
+            max_total_bytes=1000,
+            max_uploads_per_hour=10,
+        )
+        await files.append_chunk(
+            file_id=file_id, user_id=owner, seq=0, data=raw, max_total_bytes=1000
+        )
+        await files.finish_upload(
+            file_id=file_id,
+            user_id=owner,
+            sha256=hashlib.sha256(raw).hexdigest(),
+            line_count=1,
+            retention_seconds=3600,
+            check_owner=False,
+        )
+        batch = await store.create_batch(
+            batch_id=f"batch_{uuid.uuid4().hex}",
+            user_id=owner,
+            key_hash=None,
+            endpoint="/v1/chat/completions",
+            model_ids=[],
+            items=[],
+            metadata=None,
+            completion_window_seconds=3600,
+            api_surface="openai_file",
+            phase="validating",
+            input_file_id=file_id,
+        )
+        await store.claim_batch_work(
+            phase="validating", worker_id="review-validator", lease_seconds=60
+        )
+        monkeypatch.setattr(
+            validation,
+            "authenticate_stored_key",
+            AsyncMock(
+                side_effect=StoredKeyOrganizationSuspended(
+                    {"organization_id": "o1", "organization_name": "Example University"}
+                )
+            ),
+        )
+
+        async def validate() -> str:
+            return await validation.validate_file_batch(
+                store=store,
+                file_store=files,
+                batch=batch,
+                worker_id="review-validator",
+                services=SimpleNamespace(),
+                cfg=BatchConfig(),
+                lease_seconds=60,
+            )
+
+        async def leased_again() -> list[str]:
+            leased = await store.claim_batch_work(
+                phase="validating", worker_id="review-validator", lease_seconds=60
+            )
+            return [row["id"] for row in leased]
+
+        # Not failed, and not paused: the lease of a batch that waits for
+        # validation reads no pause, so one would hold nothing back.
+        assert await validate() == "retry"
+        row = await store.get_batch(batch["id"])
+        assert row["status"] == "validating"
+        assert row["validation_error"] is None
+        assert (row["paused_until"], row["paused_reason"]) == (None, None)
+        # It keeps its lease, so it is not tried again before the lease ends ...
+        assert await leased_again() == []
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE batch_jobs SET work_expires_at = now() - interval '1 second' WHERE id = $1",
+                batch["id"],
+            )
+        # ... and then it is, each time with the same answer while the
+        # organization is suspended.
+        assert await leased_again() == [batch["id"]]
+        assert await validate() == "retry"
+        assert (await store.get_batch(batch["id"]))["status"] == "validating"
+
+        # After a restore the same key authenticates, and the input is judged.
+        monkeypatch.setattr(
+            validation, "authenticate_stored_key", AsyncMock(return_value={"user_id": owner})
+        )
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE batch_jobs SET work_expires_at = now() - interval '1 second' WHERE id = $1",
+                batch["id"],
+            )
+        assert await leased_again() == [batch["id"]]
+        assert await validate() != "retry"
+    finally:
+        await store.delete_user_batches(owner)
+        await pool.close()
 
 
 async def test_unpaired_surrogate_custom_id_fails_batch_validation(monkeypatch):

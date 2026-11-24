@@ -21,9 +21,14 @@ from serving.batch import config as batch_config_module, scheduler as scheduler_
 from serving.batch.dispatch import DispatchResult
 from serving.batch.interactive_load import InteractiveLoad
 from serving.batch.scheduler import BatchScheduler, SchedulerTimings
-from serving.servers.auth import StoredKeyQuotaExceeded, StoredKeyRejected
+from serving.servers.auth import (
+    StoredKeyOrganizationSuspended,
+    StoredKeyQuotaExceeded,
+    StoredKeyRejected,
+)
 from serving.servers.concurrency import UserConcurrencyLimiter, static_limits_provider
 from serving.spend_ledger import SPEND_CHECK_KEY, SpendCheck, SpendLedger
+from serving.storage.batch_store import ORGANIZATION_PAUSE_SECONDS, PAUSE_ORGANIZATION_SUSPENDED
 
 OWNER = "owner-1"
 OK = DispatchResult(
@@ -667,6 +672,41 @@ async def test_a_spent_organization_limit_pauses_the_owners_batches_like_its_mon
     assert store.pause_key_hashes[OWNER] is None
     assert store.paused[OWNER] <= datetime.now(UTC) + timedelta(seconds=SLOW.budget_recheck_seconds)
     assert store.count("queued") == 2
+    assert dispatch.calls == []
+
+
+async def test_a_suspended_organization_pauses_the_owners_batches_and_fails_none(
+    worker, dispatch, auth
+):
+    """A restore undoes a suspension, so the key is not treated as one that is gone."""
+    auth.outcome = StoredKeyOrganizationSuspended(
+        {"organization_id": "o1", "organization_name": "Example University"}
+    )
+    store = FakeStore()
+    store.add(2)
+    scheduler = worker(store)
+    before = datetime.now(UTC)
+
+    scheduler.start()
+    await until(lambda: OWNER in store.paused)
+    await settle()
+
+    # A reason of its own, for the whole account, which a restore lifts.
+    assert store.pause_reasons[OWNER] == PAUSE_ORGANIZATION_SUSPENDED
+    assert store.pause_key_hashes[OWNER] is None
+    # Without a restore the key is checked again within 5 minutes. The pause
+    # must stay this short: a worker that read the status just before a
+    # restore writes its pause just after the restore lifted the others.
+    assert ORGANIZATION_PAUSE_SECONDS <= 300
+    # A batch that waits for validation gets no pause: it is tried again when
+    # its work lease ends, which is the same bound.
+    assert SchedulerTimings().work_lease_seconds <= 300
+    assert before + timedelta(seconds=ORGANIZATION_PAUSE_SECONDS) <= store.paused[OWNER]
+    assert store.paused[OWNER] <= datetime.now(UTC) + timedelta(seconds=ORGANIZATION_PAUSE_SECONDS)
+    # Nothing failed, nothing ran, and the items wait.
+    assert store.batches["b1"]["status"] != "failed"
+    assert store.count("queued") == 2
+    assert store.count("failed") == 0
     assert dispatch.calls == []
 
 

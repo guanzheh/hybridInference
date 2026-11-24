@@ -46,7 +46,8 @@ async def test_the_tables_arrive_empty_and_existing_rows_are_untouched(scratch):
             "INSERT INTO admin_audit_log (admin_ip, action) VALUES ('unknown', 'create_user')"
         )
 
-    await mig.upgrade(scratch)
+    # To this revision, not to the head: a later revision adds its own columns.
+    await mig.upgrade(scratch, "0023_orgs")
 
     async with mig.connected(scratch) as conn:
         tables = {

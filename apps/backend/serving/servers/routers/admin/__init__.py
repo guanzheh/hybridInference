@@ -27,6 +27,7 @@ from serving.servers.routers.admin import (
     model_queue,
     model_visibility,
     offload_routes,
+    organization_pages,
     organizations,
     provider_definitions,
     provider_keys,
@@ -70,6 +71,7 @@ router.include_router(model_queue.router)
 router.include_router(model_visibility.router)
 router.include_router(offload_routes.router)
 router.include_router(organizations.router)
+router.include_router(organization_pages.router)
 router.include_router(provider_definitions.router)
 router.include_router(provider_keys.router)
 router.include_router(provider_routes.router)

@@ -35,6 +35,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Query, status
 
+from serving import organizations
 from serving.agent_access import AgentAccessPolicyUnavailable, resolve_agent_access_permissions
 from serving.model_access import disabled_models_of
 from serving.model_catalog import agent_model_reasoning_efforts, agent_visible_models
@@ -137,11 +138,12 @@ async def model_catalog(
         the reasoning-effort domain of each model that has one.
 
     Raises:
-        HTTPException: 403 if the account is unknown or not active.
+        HTTPException: 403 if the account is unknown or not active, or its
+            organization is suspended.
     """
     store = _require_store(store)
     user = await store.get_user_by_id(user_id)
-    if user is None or user.get("status") != "active":
+    if not await organizations.account_available(store, user):
         raise _error(
             status.HTTP_403_FORBIDDEN,
             "subject_unavailable",
@@ -196,17 +198,23 @@ async def user_status(
         store: Operational store.
 
     Returns:
-        Existence, active flag, status, role and email.
+        Existence, active flag, status, role and email. A member of a
+        suspended organization is reported as a suspended account is.
     """
     store = _require_store(store)
     user = await store.get_user_by_id(user_id)
     if user is None:
         return {"user_id": user_id, "exists": False, "active": False}
+    account_status = user.get("status")
+    active = await organizations.account_available(store, user)
+    if account_status == "active" and not active:
+        # A member of a suspended organization: the answer for a suspended account.
+        account_status = "suspended"
     return {
         "user_id": user["id"],
         "exists": True,
-        "active": user.get("status") == "active",
-        "status": user.get("status"),
+        "active": active,
+        "status": account_status,
         "role": user.get("role") or "free",
         "email": user.get("email"),
     }
@@ -224,12 +232,13 @@ async def user_agent_access(
     rather than the user's profile or a deployment-specific role rule.
 
     Raises:
-        HTTPException: 403 if the account is unknown or inactive, or 503 if
-            the deployment policy fails or returns an invalid decision.
+        HTTPException: 403 if the account is unknown or inactive or its
+            organization is suspended, or 503 if the deployment policy fails
+            or returns an invalid decision.
     """
     store = _require_store(store)
     user = await store.get_user_by_id(user_id)
-    if user is None or user.get("status") != "active":
+    if not await organizations.account_available(store, user):
         raise _error(
             status.HTTP_403_FORBIDDEN,
             "subject_unavailable",

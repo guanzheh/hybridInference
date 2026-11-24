@@ -25,6 +25,7 @@ from serving.accounting import get_accounting_policy
 from serving.audit import AuditTarget, audit_columns
 from serving.config.settings import admin_email_addresses
 from serving.model_access import normalize_disabled_models
+from serving.storage import user_usage_rollup
 from serving.storage.audit_schema import insert_audit_row
 
 if TYPE_CHECKING:
@@ -49,8 +50,55 @@ PROTECTED = "protected"
 NOT_ACTIVE = "not_active"
 NOT_REMOVED = "not_removed"
 ABOVE_LIMIT = "above_limit"
+DELETED = "deleted"
+NAME_CHANGED = "name_changed"
+CONNECTIONS_CHANGED = "connections_changed"
 
 ROLES = ("member", "admin")
+STATUSES = ("active", "suspended")
+
+
+def not_platform_administrator(account: str, exempt: str) -> str:
+    """SQL: whether an account is not a platform administrator.
+
+    A platform administrator is the ``admin`` role, or an ``ADMIN_EMAILS``
+    address whatever the role of that account says
+    (:func:`serving.organizations.is_platform_administrator`, the same rule).
+    *account* is the alias of the account's row (``role``, ``email``);
+    *exempt* is the SQL of the parameter that holds
+    :func:`serving.config.settings.admin_email_addresses`. An account with no
+    role and no listed address is not one.
+
+    Two rules of an organization leave a platform administrator out, and so
+    apply to the same members. One is single sign-on only
+    (:data:`_SSO_ONLY_ACCOUNT`). The other is what happens to the organization:
+    its suspension (:func:`suspended_for`) and its delete. If a suspension
+    refused that account, or a delete suspended it, a platform administrator
+    who is a member could lock the deployment, with nobody left to sign in and
+    restore the organization. An organization administrator is a member like
+    any other here, which is why this is not :func:`is_protected`.
+    """
+    # In parentheses: one term, also for a caller that puts it under NOT or OR.
+    return (
+        f"({account}.role IS DISTINCT FROM 'admin' "
+        f"AND NOT COALESCE(lower({account}.email) = ANY({exempt}::text[]), FALSE))"
+    )
+
+
+def suspended_for(organization: str, account: str, exempt: str) -> str:
+    """SQL: whether the organization is suspended for an account.
+
+    *organization* is the alias of its row; *account* and *exempt* are those of
+    :func:`not_platform_administrator`. The one definition every reader of the
+    status uses (the key lookups, the quota context of an account,
+    :meth:`PostgresOrganizationsMixin.get_suspended_organization`), so that no
+    two of them can disagree about who a suspension applies to. NULL where the
+    account is in no organization and the organization is joined from the left.
+    """
+    return (
+        f"({organization}.status = 'suspended' AND {not_platform_administrator(account, exempt)})"
+    )
+
 
 # Two events make an account a member: a sign-in that makes or links an identity
 # of a connection, and the attach of a connection to an organization. Each looks
@@ -73,7 +121,7 @@ SIGN_IN_LOCK_SQL = f"SELECT pg_advisory_xact_lock_shared({_MEMBERSHIP_LOCK})"
 LIMITS = ("monthly_limit", "default_member_monthly_limit")
 
 _ORGANIZATION_SELECT = (
-    "SELECT o.id, o.name, o.monthly_limit_usd, o.monthly_limit_amount, "
+    "SELECT o.id, o.name, o.status, o.monthly_limit_usd, o.monthly_limit_amount, "
     "o.default_member_monthly_limit_usd, o.default_member_monthly_limit_amount, "
     "o.accounting_currency, o.created_at, o.updated_at, "
     "(SELECT COUNT(*) FROM org_memberships m WHERE m.organization_id = o.id) "
@@ -86,7 +134,8 @@ _ORGANIZATION_SELECT = (
 
 _MEMBERSHIP_SELECT = (
     "SELECT m.user_id, m.organization_id, m.role, m.joined_at, m.removed_at, m.removed_by, "
-    "m.disabled_models, o.name AS organization_name, u.role AS account_role "
+    "m.disabled_models, o.name AS organization_name, o.status AS organization_status, "
+    "u.role AS account_role "
     "FROM org_memberships m JOIN orgs o ON o.id = m.organization_id "
     "JOIN users u ON u.id = m.user_id "
 )
@@ -237,6 +286,12 @@ _AMOUNT = "COALESCE(c.cost_amount, c.cost_usd * $2::numeric)"
 _LOG_AMOUNT = "COALESCE(l.cost_amount, l.cost_usd * $2::numeric)"
 
 _THIS_MONTH = "to_char(date_trunc('month', NOW() AT TIME ZONE 'UTC'), 'YYYY-MM-DD')"
+
+#: The logged requests of each member of any organization in a span of UTC
+#: days (``$1``, ``$2``), from the rollup behind the Admin user list.
+_MEMBER_REQUEST_COUNTS = user_usage_rollup.request_counts_sql(
+    "IN (SELECT user_id FROM org_memberships)"
+)
 
 
 def contains_pattern(text: str) -> str:
@@ -401,10 +456,7 @@ async def lock_for_sign_in(conn: Any) -> None:
 #: that signs in through single sign-on only. ``{exempt}`` is the parameter
 #: that holds the ``ADMIN_EMAILS`` addresses, which make an administrator of an
 #: account whose role does not say so yet.
-_SSO_ONLY_ACCOUNT = (
-    "u.role IS DISTINCT FROM 'admin' "
-    "AND NOT COALESCE(lower(u.email) = ANY(${exempt}::text[]), FALSE)"
-)
+_SSO_ONLY_ACCOUNT = not_platform_administrator("u", "${exempt}")
 
 
 async def close_password_sign_in(conn: Any, user_ids: Sequence[str]) -> None:
@@ -465,6 +517,32 @@ async def join_organization(conn: Any, *, user_id: str, provider_id: str) -> str
     if organization_id is not None:
         await close_password_sign_in(conn, [user_id])
     return organization_id
+
+
+async def refused_by_connection(
+    conn: Any, *, provider_id: str, account_role: str | None, account_email: str | None
+) -> bool:
+    """Whether the organization *provider_id* belongs to is suspended for an account.
+
+    For a sign-in that makes or links an identity of the connection, which
+    would make the account a member: a suspended organization gets no new
+    member that it then refuses. *account_role* and *account_email* are those
+    of the account, which can have no row yet; the suspension does not apply to
+    a platform administrator (:func:`suspended_for`). Its transaction took
+    :func:`lock_for_sign_in` first.
+    """
+    return bool(
+        await conn.fetchval(
+            "SELECT 1 FROM org_sso_connections c "
+            "JOIN orgs o ON o.id = c.organization_id "
+            "CROSS JOIN (SELECT $2::text AS role, $3::text AS email) a "
+            f"WHERE c.provider_id = $1 AND {suspended_for('o', 'a', '$4')}",
+            provider_id,
+            account_role,
+            account_email,
+            admin_email_addresses(),
+        )
+    )
 
 
 async def in_other_organization(conn: Any, *, user_id: str, provider_id: str) -> bool:
@@ -541,6 +619,12 @@ class PostgresOrganizationsMixin:
     async def _suspend_user_on(self, conn: Any, user_id: str, **fields: Any) -> None:
         raise NotImplementedError
 
+    async def _lock_all_accounts_on(self, conn: Any) -> None:
+        raise NotImplementedError
+
+    async def _suspend_accounts_on(self, conn: Any, user_ids: Sequence[str], **fields: Any) -> None:
+        raise NotImplementedError
+
     # -- the organization ----------------------------------------------------
 
     async def create_organization(
@@ -610,11 +694,96 @@ class PostgresOrganizationsMixin:
             row = await conn.fetchrow(_ORGANIZATION_SELECT + "WHERE o.id = $1", organization_id)
         return dict(row) if row else None
 
-    async def list_organizations(self) -> list[dict]:
-        """Every organization, by name."""
+    async def list_organizations(
+        self, *, first_day: date | None = None, last_day: date | None = None
+    ) -> list[dict]:
+        """Every organization, by name, with the usage of a span of UTC days when one is given.
+
+        Each row has the organization with its member count and the ids of its
+        SSO connections, and with them:
+
+        - ``spent_month_usd`` and ``spent_month_amount``: its counter for this
+          UTC month, the row its limit is checked against;
+        - ``administrators``: its members with the administrator role.
+
+        With *first_day* and *last_day*, also the usage of its members in that
+        span:
+
+        - ``cost_usd`` and ``cost_amount``: what they spent, from the cost
+          counters (``user_daily_cost``), as :meth:`get_organization_usage`
+          sums them for one organization;
+        - ``requests``: their logged requests, free and failed ones too, from
+          the rollup behind the Admin user list
+          (:func:`serving.storage.user_usage_rollup.request_counts_sql`). The
+          request log is read only for the days the rollup does not hold.
+
+        One read for each of these and one for the organizations: three, or
+        five with a span. The number does not grow with the number of
+        organizations.
+        """
+        rate = get_accounting_policy().usd_to_currency_rate
+        spent: list[Any] = []
+        asked: list[Any] = []
         async with self._pool.acquire() as conn:
-            rows = await conn.fetch(_ORGANIZATION_SELECT + "ORDER BY lower(o.name), o.id")
-        return [dict(row) for row in rows]
+            organizations = [
+                dict(row)
+                for row in await conn.fetch(_ORGANIZATION_SELECT + "ORDER BY lower(o.name), o.id")
+            ]
+            if first_day is not None and last_day is not None:
+                spent = await conn.fetch(
+                    "SELECT m.organization_id, SUM(c.cost_usd) AS cost_usd, "
+                    f"SUM({_AMOUNT}) AS cost_amount "
+                    "FROM user_daily_cost c JOIN org_memberships m ON m.user_id = c.user_id "
+                    "WHERE c.day >= $1 AND c.day <= $3 GROUP BY m.organization_id",
+                    first_day.isoformat(),
+                    rate,
+                    last_day.isoformat(),
+                )
+                async with conn.transaction():
+                    await conn.execute(user_usage_rollup.NO_JIT_SQL)
+                    asked = await conn.fetch(
+                        "SELECT m.organization_id, SUM(r.request_count)::bigint AS requests "
+                        f"FROM ({_MEMBER_REQUEST_COUNTS}) r "
+                        "JOIN org_memberships m ON m.user_id = r.user_id "
+                        "GROUP BY m.organization_id",
+                        first_day,
+                        last_day,
+                    )
+            month = await conn.fetch(
+                f"SELECT c.scope_id, c.cost_usd, {_AMOUNT} AS cost_amount "
+                "FROM spend_counters c WHERE c.scope_id = ANY($1::text[]) "
+                "AND c.period = 'm:' || to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM')",
+                [organization_scope(row["id"]) for row in organizations],
+                rate,
+            )
+            administrators = await conn.fetch(
+                "SELECT m.organization_id, m.user_id, u.email, u.user_name, u.last_login_at "
+                "FROM org_memberships m JOIN users u ON u.id = m.user_id "
+                "WHERE m.role = 'admin' "
+                "ORDER BY lower(COALESCE(u.email, '')), m.user_id"
+            )
+        spent_by = {row["organization_id"]: row for row in spent}
+        asked_by = {row["organization_id"]: row["requests"] for row in asked}
+        month_by = {row["scope_id"]: row for row in month}
+        administrators_by: dict[str, list[dict]] = {}
+        for row in administrators:
+            person = dict(row)
+            administrators_by.setdefault(person.pop("organization_id"), []).append(person)
+        for row in organizations:
+            counter = month_by.get(organization_scope(row["id"]))
+            row.update(
+                spent_month_usd=counter["cost_usd"] if counter else 0,
+                spent_month_amount=counter["cost_amount"] if counter else 0,
+                administrators=administrators_by.get(row["id"], []),
+            )
+            if first_day is not None and last_day is not None:
+                period = spent_by.get(row["id"])
+                row.update(
+                    cost_usd=period["cost_usd"] if period else 0,
+                    cost_amount=period["cost_amount"] if period else 0,
+                    requests=int(asked_by.get(row["id"]) or 0),
+                )
+        return organizations
 
     async def rename_organization(
         self, organization_id: str, name: str, *, actor: AuditActor
@@ -725,6 +894,193 @@ class PostgresOrganizationsMixin:
             )
         return UPDATED, old, new
 
+    # -- the status, and the delete ------------------------------------------
+
+    async def set_organization_status(
+        self, organization_id: str, status: str, *, actor: AuditActor
+    ) -> str:
+        """Suspend an organization, or restore it.
+
+        Writes the status with its audit row and nothing else. The accounts,
+        the API keys and the sessions of the members stay as they are: the
+        gateway reads the status where it authenticates an account
+        (:func:`suspended_for`), so a restore brings everything back.
+        ``"unchanged"``, with no audit row, when the organization has that
+        status already.
+        """
+        if status not in STATUSES:
+            raise ValueError(f"unknown organization status {status!r}")
+        audit = audit_columns(
+            admin_ip=None,
+            target_user_id=None,
+            actor=actor,
+            target=AuditTarget.organization(organization_id),
+            organization_id=organization_id,
+        )
+        async with self._pool.acquire() as conn, conn.transaction():
+            old = await conn.fetchval(
+                "SELECT status FROM orgs WHERE id = $1 FOR UPDATE", organization_id
+            )
+            if old is None:
+                return NOT_FOUND
+            if old == status:
+                return UNCHANGED
+            await conn.execute(
+                "UPDATE orgs SET status = $2, updated_at = NOW() WHERE id = $1",
+                organization_id,
+                status,
+            )
+            await insert_audit_row(
+                conn,
+                columns=audit,
+                action="organization.suspend" if status == "suspended" else "organization.restore",
+                details={"status": {"old": old, "new": status}},
+                success=True,
+            )
+        return UPDATED
+
+    async def get_suspended_organization(self, user_id: str, *, fresh: bool = False) -> dict | None:
+        """The suspended organization that refuses an account; None when none does.
+
+        Its id and name. None for an account in no organization, in an active
+        one, or that a suspension does not reach (:func:`suspended_for`). For a
+        caller whose own lookup reads no organization: a session, a sign-in,
+        an internal lookup. One statement through the primary keys of the
+        membership, the organization and the account. This store reads the
+        database each time, so *fresh* changes nothing here. A request-path read
+        (:data:`~serving.storage.postgres_operational.REQUEST_PATH_READS`).
+        """
+        async with self._request_connection() as conn:
+            row = await conn.fetchrow(
+                "SELECT o.id AS organization_id, o.name AS organization_name "
+                "FROM org_memberships om "
+                "JOIN orgs o ON o.id = om.organization_id "
+                "JOIN users u ON u.id = om.user_id "
+                f"WHERE om.user_id = $1 AND {suspended_for('o', 'u', '$2')}",
+                user_id,
+                admin_email_addresses(),
+            )
+        return dict(row) if row else None
+
+    async def delete_organization(
+        self,
+        organization_id: str,
+        *,
+        confirm_name: str,
+        handled_connections: Sequence[str] | None = None,
+        disabled_connections: Sequence[str] = (),
+        suspension_message: str | None = None,
+        actor: AuditActor,
+    ) -> tuple[str, dict[str, Any]]:
+        """Delete an organization and suspend the accounts of its members. Not undone.
+
+        One transaction, with the audit row:
+
+        - Three locks, in this order: the membership lock, so that no sign-in
+          and no attach makes a member of the organization meanwhile (the row
+          lock alone would let a sign-in that waits for it insert a membership
+          after the delete); the key lock of all accounts, the form for a
+          write that spans accounts; the row of the organization. No other
+          path takes the first two in the other order.
+        - The organization is read again under them. ``"not_found"`` when it
+          is gone (the second of two deletes at once), ``"name_changed"``
+          when its name is not *confirm_name* any more, and
+          ``"connections_changed"`` when it has a connection that is not in
+          *handled_connections* (an attach came since the caller read them;
+          None skips this check). Nothing is deleted in these cases.
+        - Every member account that is active and is not a platform
+          administrator's (:func:`not_platform_administrator`) is suspended as an
+          administrator's suspension does it: its sessions end and its keys
+          are revoked. An account that waits for approval is left as it is.
+        - The organization goes, and its memberships and connections with it
+          (``ON DELETE CASCADE``). Its spend counters have no foreign key, so
+          they are removed here.
+
+        *disabled_connections* is recorded in the audit row: the provider ids
+        the caller switched off before this call. Returns the outcome and, for
+        ``"deleted"``, the name, the number of members, the ids of the accounts
+        suspended (``suspended_user_ids``) and the ids of the connections.
+        """
+        audit = audit_columns(
+            admin_ip=None,
+            target_user_id=None,
+            actor=actor,
+            target=AuditTarget.organization(organization_id),
+            organization_id=organization_id,
+        )
+        async with self._pool.acquire() as conn, conn.transaction():
+            await conn.execute(ATTACH_LOCK_SQL)
+            await self._lock_all_accounts_on(conn)
+            name = await conn.fetchval(
+                "SELECT name FROM orgs WHERE id = $1 FOR UPDATE", organization_id
+            )
+            if name is None:
+                return NOT_FOUND, {}
+            if name != confirm_name:
+                return NAME_CHANGED, {"name": name}
+            connections = [
+                row["provider_id"]
+                for row in await conn.fetch(
+                    "SELECT provider_id FROM org_sso_connections "
+                    "WHERE organization_id = $1 ORDER BY created_at, provider_id",
+                    organization_id,
+                )
+            ]
+            if handled_connections is not None and set(connections) - set(handled_connections):
+                return CONNECTIONS_CHANGED, {"name": name, "connections": connections}
+            # The membership rows are locked before the statuses are read. A
+            # restore of a member by its organization holds its row until it
+            # commits: without this lock the next statement would not wait
+            # for it, would read the account as still suspended, and would
+            # leave it active, in no organization.
+            members = len(
+                await conn.fetch(
+                    "SELECT user_id FROM org_memberships "
+                    "WHERE organization_id = $1 ORDER BY user_id FOR UPDATE",
+                    organization_id,
+                )
+            )
+            suspended = [
+                row["id"]
+                for row in await conn.fetch(
+                    "SELECT u.id FROM users u "
+                    "JOIN org_memberships m ON m.user_id = u.id "
+                    "WHERE m.organization_id = $1 AND u.status = 'active' "
+                    f"AND {not_platform_administrator('u', '$2')} "
+                    "ORDER BY u.id FOR UPDATE OF u",
+                    organization_id,
+                    admin_email_addresses(),
+                )
+            ]
+            if suspended:
+                await self._suspend_accounts_on(
+                    conn, suspended, suspension_message=suspension_message
+                )
+            await conn.execute("DELETE FROM orgs WHERE id = $1", organization_id)
+            await conn.execute(
+                "DELETE FROM spend_counters WHERE scope_id = $1",
+                organization_scope(organization_id),
+            )
+            await insert_audit_row(
+                conn,
+                columns=audit,
+                action="organization.delete",
+                details={
+                    "name": name,
+                    "members": members,
+                    "accounts_suspended": len(suspended),
+                    "connections": connections,
+                    "connections_disabled": list(disabled_connections),
+                },
+                success=True,
+            )
+        return DELETED, {
+            "name": name,
+            "members": members,
+            "suspended_user_ids": suspended,
+            "connections": connections,
+        }
+
     # -- SSO connections -----------------------------------------------------
 
     async def get_provider_organization(self, provider_id: str) -> str | None:
@@ -786,7 +1142,8 @@ class PostgresOrganizationsMixin:
     ) -> bool:
         """Detach a provider from its organization; False when it was not attached there.
 
-        The members stay: a membership ends only with its account.
+        The members stay: a membership ends with its account, or with its
+        organization.
         """
         audit = audit_columns(
             admin_ip=None,
@@ -822,6 +1179,15 @@ class PostgresOrganizationsMixin:
         if row is None:
             return None
         return {**row, "disabled_models": model_list(row["disabled_models"])}
+
+    async def list_organization_member_ids(self, organization_id: str) -> list[str]:
+        """The account of every member of an organization, in no order."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT user_id FROM org_memberships WHERE organization_id = $1",
+                organization_id,
+            )
+        return [row["user_id"] for row in rows]
 
     async def set_organization_member_role(
         self, organization_id: str, user_id: str, role: str, *, actor: AuditActor
@@ -1181,7 +1547,8 @@ class PostgresOrganizationsMixin:
                 "o.monthly_limit_amount AS organization_limit_amount, "
                 "mq.usd AS quota_monthly_cost_usd, mq.amount AS quota_monthly_cost_amount, "
                 "COALESCE(oc.cost_usd, 0) AS organization_spent_month_usd, "
-                "COALESCE(oc.cost_amount, 0) AS organization_spent_month_amount "
+                "COALESCE(oc.cost_amount, 0) AS organization_spent_month_amount, "
+                f"{suspended_for('o', 'u', '$2')} AS organization_suspended "
                 "FROM org_memberships om "
                 "JOIN orgs o ON o.id = om.organization_id "
                 "JOIN users u ON u.id = om.user_id "
@@ -1191,6 +1558,7 @@ class PostgresOrganizationsMixin:
                 " AND oc.period = 'm:' || to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM') "
                 "WHERE om.user_id = $1",
                 user_id,
+                admin_email_addresses(),
             )
         return dict(row) if row else None
 

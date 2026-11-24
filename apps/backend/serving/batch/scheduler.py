@@ -86,6 +86,7 @@ from serving.config.batch_routes import (
 from serving.observability import detached_tasks
 from serving.observability.alerts import AlertSeverity, alert_on_transition
 from serving.servers.auth import (
+    StoredKeyOrganizationSuspended,
     StoredKeyQuotaExceeded,
     StoredKeyRejected,
     authenticate_stored_key,
@@ -99,6 +100,8 @@ from serving.servers.concurrency import (
 from serving.shared_spend.ledger import AccountErased
 from serving.spend_ledger import spend_check_of
 from serving.storage.batch_store import (
+    ORGANIZATION_PAUSE_SECONDS,
+    PAUSE_ORGANIZATION_SUSPENDED,
     RESULT_BUDGET_SPENT_MESSAGE,
     TARGET_CHAT,
     TARGET_EMBEDDINGS,
@@ -1134,6 +1137,20 @@ class BatchScheduler:
         except StoredKeyRejected as exc:
             await self._release(entry, delay=self._timings.owner_retry_seconds)
             await self._fail_batch(batch_id, exc.reason)
+            return
+        except StoredKeyOrganizationSuspended:
+            # Not a key that will never work again: a restore undoes the
+            # suspension, and the same key then runs the batch. So nothing is
+            # failed. Every running batch of the owner waits, and a restore
+            # lifts the pause; without one the key is checked again when it
+            # ends, a few minutes later.
+            await self._release(entry, delay=self._timings.owner_retry_seconds)
+            await self._pause_owner(
+                owner,
+                datetime.now(UTC) + timedelta(seconds=ORGANIZATION_PAUSE_SECONDS),
+                "organization suspended",
+                kind=PAUSE_ORGANIZATION_SUSPENDED,
+            )
             return
         except StoredKeyQuotaExceeded as exc:
             await self._refused_spend(entry, item, exc, getattr(exc, "check", None))

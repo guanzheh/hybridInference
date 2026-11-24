@@ -286,7 +286,51 @@ GROUP BY user_id
 
 _METRICS_FOR_IDS_SQL = metrics_sql("= ANY($1::text[])")
 
-# Run inside the transaction of any statement using :func:`metrics_sql` or a
+
+def request_counts_sql(user_match: str) -> str:
+    """SQL for ``user_id`` and ``request_count`` in a span of UTC days, per matching user.
+
+    ``$1`` and ``$2`` are the first and the last day of the span (``date``).
+    The three parts of :func:`metrics_sql` that have a day, each held to the
+    span: the stored days, the days from the settled one on, and the days with
+    no coverage row. A row with no timestamp is in no day and is not counted.
+    Users with no logged row in the span are absent from the result.
+    """
+    first, end = _day_start("$1::date"), _day_start("$2::date + 1")
+    return f"""
+SELECT user_id, SUM(request_count)::bigint AS request_count
+FROM (
+    SELECT d.user_id, d.request_count
+    FROM user_usage_daily d
+    JOIN user_usage_daily_coverage c ON c.day = d.day AND c.definition = {_CURRENT}
+    WHERE d.user_id {user_match}
+      AND d.day >= $1::date AND d.day <= $2::date AND d.day < {SETTLED_DAY_SQL}
+    UNION ALL
+    SELECT l.user_id, COUNT(*)
+    FROM api_logs l
+    WHERE l.user_id {user_match}
+      AND l.timestamp >= GREATEST({_day_start(SETTLED_DAY_SQL)}, {first})
+      AND l.timestamp < {end}
+    GROUP BY l.user_id
+    UNION ALL
+    SELECT counted.*
+    FROM ({_GAP_RUNS_SQL}) gap
+    CROSS JOIN LATERAL (
+        SELECT l.user_id, COUNT(*)
+        FROM api_logs l
+        WHERE l.user_id {user_match}
+          AND l.timestamp >= GREATEST({_day_start("gap.first_day")}, {first})
+          AND l.timestamp < LEAST({_day_start("gap.end_day")}, {end})
+        GROUP BY l.user_id
+    ) counted
+    WHERE gap.end_day > $1::date AND gap.first_day <= $2::date
+) parts
+GROUP BY user_id
+"""
+
+
+# Run inside the transaction of any statement using :func:`metrics_sql`,
+# :func:`request_counts_sql` or a
 # fill. The planner's guess at the gap days, or at a day's rows, puts the cost
 # far above what is read, enough to trigger JIT compilation -- seconds spent
 # compiling scans that take milliseconds.

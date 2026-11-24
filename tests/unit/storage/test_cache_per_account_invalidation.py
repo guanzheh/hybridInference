@@ -92,6 +92,16 @@ _ORGANIZATION_WRITES: list[tuple[str, tuple[Any, ...], dict[str, Any], Any, Any]
         None,
     ),
     ("rename_organization", ("o1", "Example"), {}, "updated", "name_taken"),
+    # Whether the organization is suspended for an account is in those lookups too.
+    ("set_organization_status", ("o1", "suspended"), {}, "updated", "unchanged"),
+    ("set_organization_status", ("o1", "active"), {}, "updated", "not_found"),
+    (
+        "delete_organization",
+        ("o1",),
+        {"confirm_name": "Example"},
+        ("deleted", {"suspended_user_ids": ["u1"]}),
+        ("name_changed", {"name": "Another"}),
+    ),
 ]
 
 
@@ -228,6 +238,62 @@ async def test_a_change_to_an_organization_flushes_every_account(
     for key_hash in _ROWS:
         await cached.get_auth_context_by_key_hash(key_hash)
     assert inner.get_auth_context_by_key_hash.await_count == 6
+
+
+async def test_the_suspended_organization_of_an_account_goes_with_its_auth_entries(cached, inner):
+    """The answer for a session is evicted by what evicts the lookups of the account's keys."""
+    answers = {"u1": {"organization_id": "o1", "organization_name": "Example"}, "u2": None}
+    inner.get_suspended_organization = AsyncMock(side_effect=lambda user_id, **_: answers[user_id])
+
+    async def ask() -> int:
+        assert await cached.get_suspended_organization("u1") == answers["u1"]
+        # "None" is an answer too: it is kept, and the store is not asked again.
+        assert await cached.get_suspended_organization("u2") is None
+        return inner.get_suspended_organization.await_count
+
+    assert await ask() == 2
+    assert await ask() == 2
+
+    # A write about one account (its role, a removal) drops the answer of that account.
+    await cached.invalidate_user_auth_caches("u1")
+    assert await ask() == 3
+
+    # A suspend, a restore or a delete drops the answer of every account.
+    inner.set_organization_status = AsyncMock(return_value="updated")
+    await cached.set_organization_status("o1", "active")
+    assert await ask() == 5
+
+    # A sign-in reads the store, and what is cached stays.
+    assert await cached.get_suspended_organization("u2", fresh=True) is None
+    assert inner.get_suspended_organization.await_count == 6
+    assert await ask() == 6
+
+
+async def test_a_delete_drops_each_cached_account_row_and_the_sessions_of_those_it_suspended(
+    cached, inner
+):
+    inner.get_user_by_id = AsyncMock(side_effect=lambda user_id: {"id": user_id})
+    inner.get_suspended_organization = AsyncMock(return_value=None)
+    inner.delete_organization = AsyncMock(return_value=("deleted", {"suspended_user_ids": ["u1"]}))
+    for user_id in ("u1", "u2"):
+        await cached.get_user_by_id(user_id)
+        await cached.get_suspended_organization(user_id)
+        assert await cached.session_is_live(user_id, "sid")
+
+    await cached.delete_organization("o1", confirm_name="Example")
+
+    for user_id in ("u1", "u2"):
+        await cached.get_user_by_id(user_id)
+        await cached.get_suspended_organization(user_id)
+        await cached.session_is_live(user_id, "sid")
+    # The row of each account was read again. u2 is a member that the delete
+    # did not suspend: its row carried the models that the organization turned
+    # off for it, and the store names only the accounts that it suspended.
+    assert inner.get_user_by_id.await_count == 4
+    # The answer of the account reader was read again too.
+    assert inner.get_suspended_organization.await_count == 4
+    # The session answer only of u1, which the delete suspended.
+    assert inner.session_is_live.await_count == 3
 
 
 async def test_an_account_id_is_matched_exactly(cached, inner):

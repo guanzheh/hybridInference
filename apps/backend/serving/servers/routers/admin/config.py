@@ -74,6 +74,26 @@ async def _confirm_security_change(
         )
 
 
+async def log_config_changes(
+    op_store, changes: list[app_config.ConfigChange], *, actor: AuditActor
+) -> None:
+    """Write the ``config.update`` audit row of each stored change.
+
+    :func:`serving.config.app_config.update` stores a change and writes no
+    audit row; its caller does. One function for every caller, so that a
+    setting changed outside ``PATCH /admin/config`` (a delete of an
+    organization switches its SSO connections off) is recorded the same way.
+    """
+    for change in changes:
+        await log_admin_action(
+            op_store,
+            action="config.update",
+            details=change.audit_details(),
+            actor=actor,
+            target=AuditTarget("config", change.key),
+        )
+
+
 def _refused(exc: app_config.ConfigUpdateError) -> HTTPException:
     headers = None
     if exc.current_version is not None:
@@ -134,14 +154,7 @@ async def update_config(
         )
     except app_config.ConfigUpdateError as exc:
         raise _refused(exc) from None
-    for change in changes:
-        await log_admin_action(
-            op_store,
-            action="config.update",
-            details=change.audit_details(),
-            actor=actor,
-            target=AuditTarget("config", change.key),
-        )
+    await log_config_changes(op_store, changes, actor=actor)
     return _response(response, changes[0].version if changes else None)
 
 

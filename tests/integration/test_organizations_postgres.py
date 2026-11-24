@@ -165,8 +165,8 @@ async def test_making_an_organization_makes_the_accounts_of_its_connection_membe
     assert made["members_added"] == 1
     body = made["organization"]
     assert body["name"] == "Example University"
-    # An organization has no status until a route can change one.
-    assert "status" not in body
+    # A new organization is active: the routes that suspend and restore one change this.
+    assert body["status"] == "active"
     assert body["member_count"] == 1
     assert body["monthly_limit_usd"] == 1000.0
     assert body["default_member_monthly_limit_usd"] is None
