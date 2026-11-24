@@ -22,8 +22,8 @@ msgstr ""
 msgid "Organizations"
 msgstr "机构"
 
-msgid "This page is for an operator whose gateway serves the members of a university or a company through [single sign-on](sso.md), and who wants that organization to see and manage its own members. After reading it you can make an organization, name its administrators and set its limits, and you know what its administrators see and can change."
-msgstr "本页面向这样的运营方：网关通过[单点登录](sso.md)为某所大学或某家公司的成员提供服务，并且希望由这个机构自己查看和管理它的成员。读完后，你可以创建一个机构、指定它的管理员、设置它的上限，并且知道它的管理员能看到什么、能改什么。"
+msgid "This page is for an operator whose gateway serves the members of a university or a company through [single sign-on](sso.md), and who wants that organization to see and manage its own members. After reading it you can make an organization, name its administrators and set its limits, and you know what its administrators see and can change. You can also suspend an organization, restore it and delete it."
+msgstr "本页面向这样的运营方：网关通过[单点登录](sso.md)为某所大学或某家公司的成员提供服务，并且希望由这个机构自己查看和管理它的成员。读完后，你可以创建一个机构、指定它的管理员、设置它的上限，并且知道它的管理员能看到什么、能改什么。你还可以停用一个机构、恢复它，以及删除它。"
 
 msgid "A deployment that has no organization behaves as it did before, with one exception: an account can connect an organization account under **Settings → Single sign-on** only when its own email is in the `domains` of the provider. [Single Sign-On](sso.md) describes this rule."
 msgstr "没有创建任何机构的部署，行为和以前一样，只有一处例外：只有账号自己的邮箱在身份提供方的 `domains` 之内，账号才能在 **Settings → Single sign-on** 下关联机构账号。[单点登录](sso.md)一页说明了这条规则。"
@@ -43,8 +43,8 @@ msgstr "**机构管理员**是你授予了这个角色的成员。它能查看�
 msgid "**An account is in one organization at most, and so is an SSO connection.** A person who also wants a personal account registers a second account with another email."
 msgstr "**一个账号最多属于一个机构，一个 SSO 连接也是**。如果一个人还想要个人账号，就用另一个邮箱再注册一个账号。"
 
-msgid "A membership ends only when the account is deleted permanently. The members stay when you detach an SSO connection, and when the email of an account changes later."
-msgstr "只有账号被永久删除，成员身份才会结束。摘除 SSO 连接之后成员仍然保留；账号之后修改邮箱，成员身份也仍然保留。"
+msgid "A membership ends when the account is deleted permanently, or when you delete the organization. The members stay when you detach an SSO connection, and when the email of an account changes later."
+msgstr "账号被永久删除，或者你删除了机构，成员身份才会结束。摘除 SSO 连接之后成员仍然保留；账号之后修改邮箱，成员身份也仍然保留。"
 
 msgid "Set an organization up"
 msgstr "创建并设置一个机构"
@@ -105,6 +105,27 @@ msgstr "`DELETE /admin/organizations/{id}/connections/{provider_id}`"
 
 msgid "Detaches an SSO connection. The members stay. New accounts of the connection do not become members"
 msgstr "摘除一个 SSO 连接。成员保留。这个连接之后新建的账号不再成为成员"
+
+msgid "`POST /admin/organizations/{id}/suspend`"
+msgstr "`POST /admin/organizations/{id}/suspend`"
+
+msgid "Suspends the organization: the gateway refuses its members"
+msgstr "停用这个机构：网关拒绝它的成员"
+
+msgid "`POST /admin/organizations/{id}/restore`"
+msgstr "`POST /admin/organizations/{id}/restore`"
+
+msgid "Restores a suspended organization"
+msgstr "恢复一个被停用的机构"
+
+msgid "`DELETE /admin/organizations/{id}`"
+msgstr "`DELETE /admin/organizations/{id}`"
+
+msgid "Deletes the organization. This cannot be undone"
+msgstr "删除这个机构。这个操作不能撤销"
+
+msgid "[Suspend, restore and delete an organization](#suspend-restore-and-delete-an-organization) describes the last three."
+msgstr "[停用、恢复和删除机构](#suspend-restore-and-delete-an-organization)一节说明最后这三个调用。"
 
 msgid "An organization stores the `id` of each of its SSO connections. If you change the `id` of an entry in `SSO_PROVIDERS`, the organization loses that connection and shows it as not available. The members stay. Attach the new `id`."
 msgstr "机构保存的是每个 SSO 连接的 `id`。如果你修改了 `SSO_PROVIDERS` 里某个条目的 `id`，机构就失去这个连接，并把它显示为不可用。成员保留。把新的 `id` 挂接上去即可。"
@@ -391,6 +412,9 @@ msgstr "机构管理员移除或恢复一个成员"
 msgid "Stop using an organization"
 msgstr "停止使用一个机构"
 
+msgid "Take the administrator role back from each of its administrators and clear its monthly limit. The members keep their accounts and sign in through single sign-on as before. They stay members: their accounts have no password. To stop the members too, suspend the organization or delete it."
+msgstr "收回它每一位管理员的管理员角色，并清除它的每月上限。成员保留各自的账号，照常通过单点登录来登录。它们仍然是成员：账号没有密码。如果还要让成员停下来，就停用这个机构，或者删除它。"
+
 msgid "How a member signs in"
 msgstr "成员怎样登录"
 
@@ -484,6 +508,153 @@ msgstr "Admin 里账号所属的机构"
 msgid "**Admin → Users** shows the organization of each account. `GET /admin/users` has `organization` on each row: the id and the name of the organization, and the role of the account there, or `null`. `organization_id=<id>` keeps the members of one organization, and `organization_id=none` the accounts that have none. `GET /admin/users/{user_id}/detail` has the same field."
 msgstr "**Admin → Users** 显示每个账号所属的机构。`GET /admin/users` 的每一行带 `organization`：机构的 id 和名称，以及账号在其中的角色；不属于任何机构时为 `null`。`organization_id=<id>` 只保留某个机构的成员，`organization_id=none` 只保留不属于任何机构的账号。`GET /admin/users/{user_id}/detail` 也有这个字段。"
 
+msgid "Suspend, restore and delete an organization"
+msgstr "停用、恢复和删除机构"
+
+msgid "Suspend and restore"
+msgstr "停用和恢复"
+
+msgid "To suspend an organization is to stop its members and to change nothing else:"
+msgstr "停用一个机构，就是让它的成员停下来，其他什么都不改："
+
+msgid "While an organization is suspended, the gateway refuses each member:"
+msgstr "机构被停用期间，网关拒绝它的每一个成员："
+
+msgid "a request with an API key, on each route. A list of models, a file upload and a batch result cost nothing, and are refused too;"
+msgstr "带 API key 的请求，任何路由都一样。列出模型、上传文件、读取批量结果不花钱，也同样被拒绝；"
+
+msgid "a request that a service sends on behalf of a member, and a model call of the Cloud Agent for a member;"
+msgstr "某个服务代成员发出的请求，以及 Cloud Agent 为成员发起的模型调用；"
+
+msgid "each page of the console. A member can still sign out;"
+msgstr "控制台的每一个页面。成员仍然可以退出登录；"
+
+msgid "a sign-in through single sign-on, which is the only way that a member signs in. A person who signs in through an SSO connection of the organization for the first time gets no account."
+msgstr "通过单点登录的登录，这是成员唯一的登录方式。第一次通过这个机构的 SSO 连接登录的人，不会得到账号。"
+
+msgid "A request with an API key gets a 403 that names the organization:"
+msgstr "带 API key 的请求得到一个 403，其中有机构的名称："
+
+msgid "On `/v1/messages` and the routes below `/anthropic`, the answer has the Anthropic error form, as each refusal there has. Its type is `permission_error` and its message is `Organization suspended`."
+msgstr "在 `/v1/messages` 以及 `/anthropic` 之下的路由上，响应采用 Anthropic 的错误格式，那里的每一种拒绝都是这样。它的类型是 `permission_error`，消息是 `Organization suspended`。"
+
+msgid "The console and the sign-in page tell a member what they tell a suspended account."
+msgstr "控制台和登录页面对成员的提示，和对被停用账号的提示相同。"
+
+msgid "A suspension applies to each member, an organization administrator too. It does not apply to a member that is a platform administrator: an account with the `admin` role, or with an address in `ADMIN_EMAILS`. That account is yours, and it must be able to sign in to restore the organization."
+msgstr "停用对每一个成员生效，机构管理员也不例外。它不对身为平台管理员的成员生效：角色为 `admin` 的账号，或者邮箱在 `ADMIN_EMAILS` 里的账号。那是你的账号，它必须能登录，才能恢复这个机构。"
+
+msgid "Only the status of the organization changes. The accounts, the API keys and the sessions stay as they are. So `POST /admin/organizations/{id}/restore` brings everything back: the same API keys work, and a session that was open works again."
+msgstr "改变的只有机构的状态。账号、API key 和会话都保持原样。所以 `POST /admin/organizations/{id}/restore` 会让一切恢复：原来的 API key 可以用，原来打开的会话也可以继续用。"
+
+msgid "**A request that runs** when you suspend the organization finishes. The next request is refused."
+msgstr "你停用机构时**正在进行的请求**会执行完。下一个请求被拒绝。"
+
+msgid "**How fast.** The gateway process that handled your call refuses a member from the next request. A different process of the same deployment refuses a request with an API key from the next request too, but can take 30 seconds for `GET /v1/models` and 60 seconds for a session. A restore has the same delays."
+msgstr "**多快生效**。处理你这次调用的网关进程，从下一个请求起就拒绝成员。同一部署的其他进程，对带 API key 的请求也是从下一个请求起拒绝，但 `GET /v1/models` 可能要 30 秒，会话可能要 60 秒。恢复也有同样的延迟。"
+
+msgid "**A batch** of a member waits while the organization is suspended, and is not failed. It continues within 5 minutes after a restore. A batch whose deadline passes while it waits expires, as each paused batch does."
+msgstr "机构被停用期间，成员的**批量请求**会等待，不会被判为失败。恢复之后，它会在 5 分钟内继续。等待期间超过截止时间的批量请求会过期，和其他被暂停的批量请求一样。"
+
+msgid "**The status** of an organization is the field `status` of `GET /admin/organizations/{id}`: `active` or `suspended`."
+msgstr "机构的**状态**是 `GET /admin/organizations/{id}` 里的 `status` 字段：`active` 或 `suspended`。"
+
+msgid "Delete"
+msgstr "删除"
+
+msgid "A delete cannot be undone. To stop an organization for some time, suspend it."
+msgstr "删除不能撤销。如果只是想让一个机构停一段时间，请停用它。"
+
+msgid "`confirm_name` is the name of the organization, exactly. The call asks you to confirm who you are, as the call that gives the administrator role does. `ADMIN_TOKEN` cannot delete an organization."
+msgstr "`confirm_name` 是机构的名称，必须完全一致。这个调用要求你确认身份，和授予管理员角色的调用一样。`ADMIN_TOKEN` 不能删除机构。"
+
+msgid "A delete does this:"
+msgstr "删除会做这些事："
+
+msgid "It suspends the account of each member that is active. The sessions end, the API keys are revoked, and the suspension message names the organization. It does not suspend a platform administrator, or an account that waits for approval."
+msgstr "停用每一个处于可用状态的成员账号。它们的会话结束，API key 被吊销，停用说明里写着机构的名称。平台管理员的账号和等待审批的账号不会被停用。"
+
+msgid "It removes the organization with its memberships, its administrators, its limits, and the models that it turned off for a member."
+msgstr "移除这个机构，连同它的成员关系、管理员、上限，以及它为成员关闭的模型。"
+
+msgid "It switches the `SSO_PROVIDERS` entries of its SSO connections off (`\"enabled\": false`). If such an entry stays on and has `auto_create`, each person who signs in through it for the first time gets a personal account. Send `\"disable_connections\": false` to keep the entries as they are."
+msgstr "把它的 SSO 连接在 `SSO_PROVIDERS` 里的条目关闭（`\"enabled\": false`）。如果这样的条目保持开启并且设置了 `auto_create`，每个第一次通过它登录的人都会得到一个个人账号。发送 `\"disable_connections\": false` 可以让这些条目保持原样。"
+
+msgid "The accounts, their usage and the audit rows of the organization stay."
+msgstr "账号、它们的用量以及这个机构的审计记录都会保留。"
+
+msgid "The answer has the number of accounts that were suspended, and the `id` of each entry that was switched off. A refusal has a `code`:"
+msgstr "响应里有被停用的账号数量，以及每个被关闭的条目的 `id`。被拒绝的调用带有一个 `code`："
+
+msgid "Status and code"
+msgstr "状态码和 code"
+
+msgid "Why"
+msgstr "原因"
+
+msgid "409 `confirm_name_mismatch`"
+msgstr "409 `confirm_name_mismatch`"
+
+msgid "`confirm_name` is not the name of the organization"
+msgstr "`confirm_name` 不是这个机构的名称"
+
+msgid "409 `settings_invalid`"
+msgstr "409 `settings_invalid`"
+
+msgid "`SSO_PROVIDERS` is not valid, so its entries cannot be switched off. Correct it in **Admin → Settings**, or send `\"disable_connections\": false`"
+msgstr "`SSO_PROVIDERS` 不合法，所以无法关闭其中的条目。请在 **Admin → Settings** 里修正它，或者发送 `\"disable_connections\": false`"
+
+msgid "409 `last_sign_in`"
+msgstr "409 `last_sign_in`"
+
+msgid "You sign in only through an SSO connection of this organization. Set a password first, or send `\"disable_connections\": false`"
+msgstr "你只能通过这个机构的某个 SSO 连接登录。请先设置密码，或者发送 `\"disable_connections\": false`"
+
+msgid "409 `settings_changed`"
+msgstr "409 `settings_changed`"
+
+msgid "The settings were saved while the delete ran. Nothing changed. Send the call again"
+msgstr "删除执行期间有人保存了设置。什么都没有改变。请重新发送这个调用"
+
+msgid "503 `settings_unavailable`"
+msgstr "503 `settings_unavailable`"
+
+msgid "The gateway cannot read its settings. Nothing changed. Send the call again when the database is connected"
+msgstr "网关读不到它的设置。什么都没有改变。等数据库连上之后，请重新发送这个调用"
+
+msgid "`settings_refused`"
+msgstr "`settings_refused`"
+
+msgid "The settings refused the change. The status and the message are those that the settings gave. Nothing changed"
+msgstr "设置拒绝了这次修改。状态码和消息就是设置给出的那些。什么都没有改变"
+
+msgid "409 `organization_changed`"
+msgstr "409 `organization_changed`"
+
+msgid "The organization got a different name or one more SSO connection while the delete ran. Nothing was deleted. Read the organization, then send the call again"
+msgstr "删除执行期间，这个机构改了名称，或者多了一个 SSO 连接。什么都没有删除。请先读取这个机构，再重新发送这个调用"
+
+msgid "500 `delete_incomplete`"
+msgstr "500 `delete_incomplete`"
+
+msgid "The delete failed after it started to switch the entries off. The organization is still there. The message says if the entries are off, or if they can be off. Read `SSO_PROVIDERS` in **Admin → Settings**, then send the call again"
+msgstr "删除在开始关闭条目之后失败了。机构仍然存在。响应里的消息会说明条目是已经关闭，还是可能已经关闭。请先在 **Admin → Settings** 里查看 `SSO_PROVIDERS`，再重新发送这个调用"
+
+msgid "**The entries are switched off before the organization is deleted**, because an entry can be switched on again and a delete cannot be undone. The two steps are not one transaction. If the second step fails, the organization is still there, and nobody can start a sign-in through its SSO connections. Send the call again, or switch the entries on in **Admin → Settings**."
+msgstr "**先关闭条目，再删除机构**，因为条目可以重新开启，而删除不能撤销。这两步不在同一个事务里。如果第二步失败，机构仍然存在，但没有人能通过它的 SSO 连接开始登录。请重新发送这个调用，或者在 **Admin → Settings** 里把条目重新开启。"
+
+msgid "**An entry that is off stops each account that signs in through it**: an account that is in no organization and an account with the `admin` role too. An account that signed in only through it sets a password with **Forgot password**, which needs outgoing email."
+msgstr "**被关闭的条目会挡住每一个通过它登录的账号**：不属于任何机构的账号和角色为 `admin` 的账号也一样。只通过它登录的账号可以用 **Forgot password** 设置密码，这需要部署能够发送邮件。"
+
+msgid "**A different gateway process** applies the change of `SSO_PROVIDERS` within 10 seconds. Until then, a first sign-in on that process can still make a personal account."
+msgstr "**其他网关进程**会在 10 秒内应用 `SSO_PROVIDERS` 的这次修改。在那之前，那个进程上的首次登录仍然可能创建个人账号。"
+
+msgid "**To make an account active again**, use **Admin → Users**. The account is then in no organization, and its API keys stay revoked. It has no password, because a member has none. Its owner sets one with **Forgot password**, which needs outgoing email."
+msgstr "**要让一个账号重新可用**，请用 **Admin → Users**。此后这个账号不属于任何机构，它的 API key 仍然是吊销状态。它没有密码，因为成员没有密码。账号的主人可以用 **Forgot password** 设置密码，这需要部署能够发送邮件。"
+
+msgid "**To use an SSO connection again**, attach it to an organization first, and switch its entry on in **Admin → Settings** after that. In the other order, an entry with `auto_create` makes personal accounts until it is attached."
+msgstr "**要重新使用一个 SSO 连接**，请先把它挂接到一个机构，然后再在 **Admin → Settings** 里开启它的条目。顺序反过来的话，设置了 `auto_create` 的条目在挂接之前会创建个人账号。"
+
 msgid "`organization.member_models.set`"
 msgstr "`organization.member_models.set`"
 
@@ -496,6 +667,21 @@ msgstr "`organization.member_key.revoke`"
 msgid "An organization administrator revokes an API key of a member"
 msgstr "机构管理员作废某个成员的一把 API key"
 
+msgid "`organization.suspend`, `organization.restore`"
+msgstr "`organization.suspend`、`organization.restore`"
+
+msgid "You suspend or restore an organization. A call that changes nothing writes no row"
+msgstr "你停用或恢复一个机构。没有改变任何东西的调用不写记录"
+
+msgid "`organization.delete`"
+msgstr "`organization.delete`"
+
+msgid "You delete an organization. The row has the number of members, the number of accounts that were suspended, and the SSO connections"
+msgstr "你删除一个机构。记录里有成员数量、被停用的账号数量，以及它的 SSO 连接"
+
+msgid "A delete that switches `SSO_PROVIDERS` entries off also writes a `config.update` row, as a save in **Admin → Settings** does. That row belongs to no organization. A delete that answered `delete_incomplete` can have switched the entries off without this row. The setting then still shows who changed it last."
+msgstr "关闭了 `SSO_PROVIDERS` 条目的删除还会写一条 `config.update` 记录，和在 **Admin → Settings** 里保存设置时一样。这条记录不属于任何机构。返回 `delete_incomplete` 的删除可能已经关闭了条目，却没有写这条记录。这种情况下，设置本身仍然记着最后是谁修改了它。"
+
 msgid "`python -m serving.auth.reset_password` refuses a member too."
 msgstr "`python -m serving.auth.reset_password` 同样拒绝成员。"
 
@@ -507,9 +693,6 @@ msgstr "**模型。** 机构管理员可以对单个成员关闭某个模型。�
 
 msgid "**A change of a limit, of the role of a member or of its models applies within 60 seconds.** A revoked key stops within 30 seconds."
 msgstr "**修改上限、成员的角色或成员的模型，在 60 秒内生效。** 作废的 key 在 30 秒内失效。"
-
-msgid "Take the administrator role back from each of its administrators and clear its monthly limit. The members keep their accounts and sign in through single sign-on as before. They stay members: their accounts have no password."
-msgstr "收回它每一位管理员的管理员角色，并清除它的每月上限。成员保留各自的账号，照常通过单点登录来登录。它们仍然是成员：账号没有密码。"
 
 msgid "The figures of a member are of its whole account. They are the figures that **Admin → Users** shows for that account. So an organization administrator also sees what an account used before it became a member, for example an account that existed when you attached the connection."
 msgstr "成员的数字是它整个账号的数字，也就是 **Admin → Users** 里这个账号的那些数字。所以机构管理员也能看到账号成为成员之前的用量，例如你挂上连接时已经存在的账号。"
